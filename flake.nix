@@ -47,6 +47,15 @@
             dependencies = skillDeps.${name} or [ ];
           };
           pythonSkills = map mkSkill skillNames;
+
+          # kernel env for the ipython tool; uv auto-bootstrap can't run on NixOS
+          # (uv-managed CPython needs /lib64/ld-linux-x86-64.so.2).
+          kernelPython = pkgs.python3.withPackages (ps: with ps; [
+            ipykernel dill nest-asyncio
+            requests httpx pyyaml tomli python-dotenv
+            pandas numpy scipy beautifulsoup4 lxml pydantic
+            tyro prime-agent-runtime
+          ] ++ pythonSkills);
         in
         {
           default = pkgs.buildNpmPackage {
@@ -88,41 +97,29 @@
             # The default installPhase packs only the ROOT package (no bin;
             # the pi bin lives in the coding-agent workspace), so override it:
             # ship the whole built tree so the runtime layout matches the repo.
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+
             installPhase = ''
               runHook preInstall
-              mkdir -p $out
-              cp -a . $out/
-              chmod +x $out/prime-agent.sh
+              mkdir -p $out/lib
+              cp -a . $out/lib/prime-agent
+              chmod +x $out/lib/prime-agent/prime-agent.sh
+              makeWrapper ${pkgs.nodejs_22}/bin/node $out/bin/prime-agent \
+                --add-flags "$out/lib/prime-agent/packages/coding-agent/dist/bundle/cli.js" \
+                --prefix PATH : ${pkgs.nodejs_22}/bin \
+                --set-default PRIME_AGENT_KERNEL_PYTHON ${kernelPython}/bin/python
               runHook postInstall
             '';
           };
 
-          # kernel env for the ipython tool; uv auto-bootstrap can't run on NixOS
-          # (uv-managed CPython needs /lib64/ld-linux-x86-64.so.2).
-          kernel-python = pkgs.python3.withPackages (ps: with ps; [
-            ipykernel dill nest-asyncio
-            requests httpx pyyaml tomli python-dotenv
-            pandas numpy scipy beautifulsoup4 lxml pydantic
-            tyro prime-agent-runtime
-          ] ++ pythonSkills);
+          kernel-python = kernelPython;
         });
 
-      apps = forAllSystems (system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-          pkg = self.packages.${system}.default;
-          nodejs = pkgs.nodejs_22;
-          kernelPython = self.packages.${system}.kernel-python;
-        in
-        {
-          default = {
-            type = "app";
-            program = "${pkgs.writeShellScript "prime-agent" ''
-              export PATH="${nodejs}/bin:$PATH"
-              export PRIME_AGENT_KERNEL_PYTHON="''${PRIME_AGENT_KERNEL_PYTHON:-${kernelPython}/bin/python}"
-              exec node "${pkg}/packages/coding-agent/dist/bundle/cli.js" "$@"
-            ''}";
-          };
-        });
+      apps = forAllSystems (system: {
+        default = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/prime-agent";
+        };
+      });
     };
 }
