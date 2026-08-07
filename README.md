@@ -7,8 +7,19 @@ environment on NixOS.
 The flake fetches upstream as a non-flake input (`primeAgentSrc`) — no code is
 vendored here beyond nix glue:
 
-- `patches/` — minimal patches applied to upstream (kept small: anything
-  achievable via env var must not be a patch).
+- `extensions/` — shipped as built-in prime-agent extensions, loaded by the
+  wrapper via `--extension` on every invocation (covers interactive, RPC,
+  daemon, and subagent sessions; still active under `--no-extensions` since
+  CLI-provided extension paths are always loaded). Extensions are preferred
+  to patches because they don't rot on every `primeAgentSrc` bump.
+  - `repetition-loop-guard.ts` — "chronobreak": when streamed assistant text
+    degrades into a repetition loop (same sentence >= 3 times, or a periodic
+    phrase tail), it aborts the run, scrubs the message back to where the
+    repetition began (clean prefix and first occurrence kept, garbage
+    dropped), and re-injects a follow-up nudge so the turn re-runs from that
+    point. Gives up after 3 strikes per user turn.
+- `patches/` — minimal build-time patches applied to upstream (kept small:
+  anything achievable via env var or an extension must not be a patch).
 - `nix/package-lock.json` — upstream's committed lockfile with `resolved` +
   `integrity` restored (upstream strips them; prefetch-npm-deps drops such
   entries and `npm ci --offline` fails). Regenerate after `primeAgentSrc` bumps:

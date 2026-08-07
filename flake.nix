@@ -21,12 +21,6 @@
         # Build must not hit the network: drop `npm run generate-models` from
         # the ai build so the committed models.generated.ts is used as-is.
         ./patches/avoid-network-model-regeneration.patch
-        # Cheap models degrade into verbatim repetition loops mid-turn; the
-        # agent loop scans the streamed tail and aborts with stopReason
-        # loop_detected before the degenerate message is persisted and re-fed
-        # as context. Not achievable via env var or extension config; drop
-        # once upstream merges the equivalent commit.
-        ./patches/abort-degenerate-repetition-loops.patch
       ];
     in
     {
@@ -123,8 +117,14 @@
               runHook preInstall
               mkdir -p $out/lib
               cp -a . $out/lib/prime-agent
+              # Ship the built-in chronobreak extension (degenerate
+              # repeated-output loop guard) and have the wrapper load it via
+              # --extension on every invocation so it covers every session kind
+              # (interactive, RPC, daemon, subagents) without patching upstream.
+              mkdir -p $out/lib/prime-agent/extensions
+              cp ${./extensions/repetition-loop-guard.ts} $out/lib/prime-agent/extensions/repetition-loop-guard.ts
               chmod +x $out/lib/prime-agent/prime-agent.sh
-              makeWrapper ${pkgs.nodejs_22}/bin/node $out/bin/prime-agent                 --add-flags "$out/lib/prime-agent/packages/coding-agent/dist/bundle/cli.js"                 --prefix PATH : ${pkgs.nodejs_22}/bin                 --set-default PRIME_AGENT_KERNEL_PYTHON ${kernelPython}/bin/python                 --set PI_SKIP_VERSION_CHECK 1
+              makeWrapper ${pkgs.nodejs_22}/bin/node $out/bin/prime-agent                 --add-flags "$out/lib/prime-agent/packages/coding-agent/dist/bundle/cli.js --extension $out/lib/prime-agent/extensions/repetition-loop-guard.ts"                 --prefix PATH : ${pkgs.nodejs_22}/bin                 --set-default PRIME_AGENT_KERNEL_PYTHON ${kernelPython}/bin/python                 --set PI_SKIP_VERSION_CHECK 1
               runHook postInstall
             '';
 

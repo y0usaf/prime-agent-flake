@@ -1,105 +1,224 @@
 /**
- * Prime Agent extension — degenerate repeated-output loop guard ("chronobreak").
+ * Prime Agent extension — "chronobreak": terminates assistant generation loops.
  *
- * Cheap models degrade mid-turn into verbatim sentence loops ("Let me X."
- * repeated hundreds of times), appending hundreds of KB that then get
- * persisted and re-fed as context. This extension keeps a rolling 4 KB tail
- * of the streamed assistant text, detects when it decomposes into N identical
- * copies of a periodic sentence, and aborts the request so the degenerate
- * message is cut within a few KB instead of being persisted in full.
+ * The failure: the model emits the same prose/sentence over and over inside
+ * one turn, never settling on an action, and every repetition appends to the
+ * session (output degradation). On detection chronobreak:
  *
- * It is shipped by the prime-agent-flake wrapper via `--extension` so it
- * covers every session kind (interactive, RPC, daemon, subagents) and stays
- * active even under `--no-extensions` (CLI-provided extension paths are still
- * loaded). This replaces the previous Nix build patch to the agent loop.
+ *  1. Aborts the run (ctx.abort()).
+ *  2. Scrubs the polluted assistant message back to WHERE THE REPETITION
+ *     BEGINS: everything before the loop (including the first occurrence of
+ *     the repeated segment) is kept, the repeated garbage is dropped, and a
+ *     truncation marker is appended.
+ *  3. Re-injects a follow-up nudge so the model continues from that point
+ *     with one decisive action. Gives up after 3 strikes per user turn.
+ *
+ * Detection is two-tier, recomputed from the whole accumulated message on
+ * every message_update (the event carries the full partial message):
+ *  - segment tier: the same normalized sentence/line appearing >= 3 times
+ *    (catches prose loops; cut = start of the 2nd occurrence);
+ *  - periodic tier: the streamed tail decomposing into >= 8 identical copies
+ *    of a >= 20-char phrase (catches boundary-less loops; cut keeps one copy).
+ *
+ * Hooked at the framework event layer (message_update / message_end /
+ * agent_end / input), so it observes every assistant message in every mode
+ * (interactive, RPC, daemon, subagents) no matter which internal stream path
+ * produced it. Shipped by prime-agent-flake via `--extension`, which stays
+ * active even under `--no-extensions`. This replaces the earlier Nix build
+ * patch to the agent loop.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-// Detects degenerate verbatim-sentence repetition ("Let me X." repeated
-// thousands of times) so the loop can be aborted instead of streaming it.
-// A rolling tail is kept; we periodically test whether the tail decomposes
-// into N identical copies of a p>=MIN_PERIOD sentence. Returns the repeated
-// phrase length observed, or 0 when no loop is present.
-const LOOP_TAIL = 4096;
-const LOOP_MIN_PERIOD = 20; // sentence length floor (chars)
-const LOOP_MIN_TOTAL = 2048; // repeated span that must be exceeded (chars)
+const MAX_STRIKES = 3; // per user-turn give-up: no abort/re-run spin loop
+const MAX_SEGMENT_REPEAT = 3; // same normalized segment appearing this many times in one message
+const MIN_CHUNK_LEN = 12; // ignore tiny fragments (punctuation, spacing)
+const LOOP_TAIL = 4096; // periodic tier: window of streamed text scanned
+const LOOP_MIN_PERIOD = 20; // periodic tier: phrase length floor (chars)
+const LOOP_MIN_TOTAL = 2048; // periodic tier: repeated span that must be exceeded (chars)
+const SCRUB_MARKER = "[chronobreak: repeated output truncated here - re-running]";
 
-function detectRepetitionLoop(tail: string): number {
-	if (tail.length < LOOP_MIN_TOTAL) return 0;
-	const win = tail.slice(-LOOP_TAIL);
-	// Try period p (sentence-ish length). For large windows the "N identical
-	// copies" test is O(p); bounded by LOOP_TAIL per check.
+/**
+ * Normalize a text chunk: collapse whitespace, drop punctuation, lowercase.
+ * Identical sentences with cosmetic differences hash to the same key.
+ */
+function keyOf(chunk: string): string {
+	return chunk
+		.replace(/\s+/g, " ")
+		.replace(/[^\p{L}\p{N} ]/gu, "")
+		.trim()
+		.toLowerCase();
+}
+
+interface Segment {
+	key: string;
+	start: number; // raw offset of the chunk in the joined text
+}
+
+/** Split into sentence/line chunks, keeping each chunk's raw start offset. */
+function segmentize(text: string): Segment[] {
+	const segments: Segment[] = [];
+	const boundary = /(?<=[.!?])\s+|\n+/g;
+	let segStart = 0;
+	const push = (start: number, end: number) => {
+		if (end <= start) return;
+		const key = keyOf(text.slice(start, end));
+		if (key.length >= MIN_CHUNK_LEN) segments.push({ key, start });
+	};
+	for (let m = boundary.exec(text); m !== null; m = boundary.exec(text)) {
+		push(segStart, m.index);
+		segStart = boundary.lastIndex;
+	}
+	push(segStart, text.length);
+	return segments;
+}
+
+interface LoopHit {
+	sample: string;
+	/** Raw offset where the repetition begins (everything before it is kept). */
+	cutAt: number;
+}
+
+/**
+ * Segment tier. Recomputed fresh from the full text each update: keeping
+ * counts across calls would double-count earlier segments and false-trigger.
+ * The cut lands on the SECOND occurrence of the repeated segment, so the
+ * legitimate first occurrence survives the scrub.
+ */
+function detectSegmentLoop(text: string): LoopHit | null {
+	const counts = new Map<string, { count: number; secondStart: number }>();
+	for (const seg of segmentize(text)) {
+		const entry = counts.get(seg.key) ?? { count: 0, secondStart: -1 };
+		entry.count += 1;
+		if (entry.count === 2) entry.secondStart = seg.start;
+		counts.set(seg.key, entry);
+		if (entry.count >= MAX_SEGMENT_REPEAT) {
+			return { sample: seg.key, cutAt: entry.secondStart };
+		}
+	}
+	return null;
+}
+
+/**
+ * Periodic tier: does the tail of the text decompose into >= 8 identical
+ * copies of a p >= LOOP_MIN_PERIOD phrase? Catches degenerate repetition that
+ * never crosses a sentence/line boundary. The cut keeps one copy of the
+ * phrase, dropping the rest.
+ */
+function detectPeriodicLoop(text: string): LoopHit | null {
+	if (text.length < LOOP_MIN_TOTAL) return null;
+	const win = text.slice(-LOOP_TAIL);
 	for (let p = LOOP_MIN_PERIOD; p * 8 <= LOOP_TAIL && p <= 1024; p++) {
 		const copies = Math.floor(LOOP_TAIL / p);
 		if (copies < 8) break;
 		const total = p * copies;
 		if (total < LOOP_MIN_TOTAL) continue;
-		const unit = win.slice(-total).slice(-p);
+		if (total > win.length) continue;
+		const span = win.slice(-total);
+		const unit = span.slice(-p);
 		let same = true;
 		for (let k = 1; k < copies; k++) {
 			const start = (copies - 1 - k) * p;
-			if (win.slice(-total).slice(start, start + p) !== unit) {
+			if (span.slice(start, start + p) !== unit) {
 				same = false;
 				break;
 			}
 		}
-		if (same) return total;
-	}
-	return 0;
-}
-
-/** Joined streamed text blocks of a (partial) assistant message, if any. */
-function joinedText(content: unknown): string {
-	if (!Array.isArray(content)) return "";
-	const out: string[] = [];
-	for (const block of content) {
-		if ((
-			block &&
-			typeof block === "object" &&
-			(block as { type?: unknown }).type === "text" &&
-			typeof (block as { text?: unknown }).text === "string"
-		)) {
-			out.push((block as { text: string }).text);
+		if (same) {
+			return { sample: unit.trim(), cutAt: text.length - total + p };
 		}
 	}
-	return out.join("");
+	return null;
+}
+
+function detectLoop(text: string): LoopHit | null {
+	return detectSegmentLoop(text) ?? detectPeriodicLoop(text);
+}
+
+function textOf(message: { content?: Array<{ type?: string; text?: string }> }): string {
+	if (!message.content) return "";
+	return message.content
+		.filter((c): c is { type: string; text: string } => c.type === "text" && typeof c.text === "string")
+		.map((c) => c.text)
+		.join("\n");
+}
+
+function buildNudge(sample: string): string {
+	const sampleLine = sample ? `\n\nRepeat detected: "${sample}"` : "";
+	return (
+		"chronobreak cut a generation loop in your previous message." +
+		sampleLine +
+		"\n\nEverything you wrote before the repetition began was kept; the message now ends with a " +
+		"truncation marker. Continue from that point. Do NOT repeat or restate earlier output. " +
+		"Take ONE decisive action in this message: a single clean tool call, or the direct final answer."
+	);
 }
 
 export default function (pi: ExtensionAPI): void {
-	// Per-assistant-stream state: the rolling tail of text we have seen, and
-	// the length of the text in the last full-partial snapshot we consumed.
-	// `message_update` carries the full partial message on every token, so the
-	// incremental delta is text.slice(lastLen). This lets us mirror the agent
-	// loop's per-text_delta accumulation without touching upstream code.
-	let streamTail = "";
-	let lastLen = 0;
-	let aborting = false;
+	let terminating = false;
+	let pendingNudge: string | undefined;
+	let strike = 0;
 
 	pi.on("message_start", (event) => {
 		if (event.message.role !== "assistant") return;
-		// A new assistant stream begins: reset per-stream accumulation.
-		streamTail = "";
-		lastLen = 0;
-		aborting = false;
+		terminating = false;
 	});
 
 	pi.on("message_update", (event, ctx) => {
-		if (aborting) return;
+		if (terminating) return;
 		if (event.message.role !== "assistant") return;
-		const text = joinedText(event.message.content);
-		if (text.length >= lastLen) {
-			streamTail = (streamTail + text.slice(lastLen)).slice(-LOOP_TAIL);
-			lastLen = text.length;
+		const text = textOf(event.message);
+		if (text.length === 0) return;
+		const hit = detectLoop(text);
+		if (!hit) return;
+
+		terminating = true;
+		strike++;
+		if (strike >= MAX_STRIKES) {
+			ctx.ui.notify(
+				"chronobreak: generation loop detected, but strike limit (" + MAX_STRIKES + ") reached. Aborting without re-run.",
+				"error",
+			);
 		} else {
-			// Content shrank (unexpected for a pure text stream): treat the
-			// current snapshot as the start of a new segment.
-			lastLen = text.length;
-			streamTail = text.slice(-LOOP_TAIL);
+			ctx.ui.notify(
+				'chronobreak: generation loop detected ("' + hit.sample + '"). Truncating at the repetition and re-running.',
+				"warning",
+			);
+			pendingNudge = buildNudge(hit.sample);
 		}
-		if (detectRepetitionLoop(streamTail) > 0) {
-			aborting = true;
-			ctx.abort();
-		}
+		ctx.abort();
+	});
+
+	// The aborted assistant message is persisted by the runtime; scrub it back
+	// to where the repetition began so the clean prefix survives and only the
+	// repeated garbage is dropped from context.
+	pi.on("message_end", (event) => {
+		if (!terminating) return;
+		if (event.message.role !== "assistant") return;
+		terminating = false;
+		const text = textOf(event.message);
+		const hit = detectLoop(text);
+		const cutAt = hit ? Math.max(0, hit.cutAt) : 0;
+		const kept = text.slice(0, cutAt).trimEnd();
+		const scrubbed = kept.length > 0 ? kept + "\n\n" + SCRUB_MARKER : SCRUB_MARKER;
+		return {
+			message: {
+				...event.message,
+				content: [{ type: "text" as const, text: scrubbed }],
+			},
+		};
+	});
+
+	pi.on("agent_end", () => {
+		if (!pendingNudge) return;
+		const nudge = pendingNudge;
+		pendingNudge = undefined;
+		pi.sendUserMessage(nudge, { deliverAs: "followUp" });
+	});
+
+	// User-driven input is a fresh direction: reset the strike counter.
+	pi.on("input", (event) => {
+		if (event.source === "extension") return;
+		strike = 0;
 	});
 }
