@@ -21,6 +21,12 @@
         # Build must not hit the network: drop `npm run generate-models` from
         # the ai build so the committed models.generated.ts is used as-is.
         ./patches/avoid-network-model-regeneration.patch
+        # Cheap models degrade into verbatim repetition loops mid-turn; the
+        # agent loop scans the streamed tail and aborts with stopReason
+        # loop_detected before the degenerate message is persisted and re-fed
+        # as context. Not achievable via env var or extension config; drop
+        # once upstream merges the equivalent commit.
+        ./patches/abort-degenerate-repetition-loops.patch
       ];
     in
     {
