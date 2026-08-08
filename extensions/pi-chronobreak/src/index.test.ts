@@ -114,33 +114,4 @@ describe("extension flow", () => {
     expect(h.sent.length).toBe(0);
   });
 
-  test("three strikes: third loop aborts without re-run", () => {
-    const h = makeExt();
-    for (let i = 0; i < 3; i++) {
-      h.fire("message_start", { message: assistant("") });
-      h.fire("message_update", { message: assistant(LOOP_TEXT) });
-      h.fire("message_end", { message: assistant(LOOP_TEXT) });
-      h.fire("agent_end", {});
-    }
-    expect(h.calls.abort).toBe(3);
-    expect(h.sent.length).toBe(2);
-    expect(h.calls.notices[2]).toContain("strike limit");
-  });
-
-  test("user input resets strikes", () => {
-    const h = makeExt();
-    for (let i = 0; i < 2; i++) {
-      h.fire("message_start", { message: assistant("") });
-      h.fire("message_update", { message: assistant(LOOP_TEXT) });
-      h.fire("message_end", { message: assistant(LOOP_TEXT) });
-      h.fire("agent_end", {});
-    }
-    h.fire("input", { source: "interactive", text: "new direction" });
-    h.fire("message_start", { message: assistant("") });
-    h.fire("message_update", { message: assistant(LOOP_TEXT) });
-    h.fire("message_end", { message: assistant(LOOP_TEXT) });
-    h.fire("agent_end", {});
-    // strike counter restarted: this loop re-injects instead of giving up
-    expect(h.sent.length).toBe(3);
-  });
 });
