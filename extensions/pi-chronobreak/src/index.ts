@@ -14,13 +14,11 @@ import { detectLoop } from "./detector";
  * replaces one assistant message, and queues a user message.
  */
 
-const MAX_STRIKES = 3; // per user-turn give-up: no abort/re-run spin loop
 const SCRUB_TEXT = "[generation loop terminated by chronobreak - re-running]";
 
 export default function (pi: ExtensionAPI): void {
   let terminating = false;
   let pendingNudge: string | undefined;
-  let strike = 0;
 
   function textOf(message: { content?: Array<{ type?: string; text?: string }> }): string {
     if (!message.content) return "";
@@ -54,19 +52,11 @@ export default function (pi: ExtensionAPI): void {
     if (!verdict.looping) return;
 
     terminating = true;
-    strike++;
-    if (strike >= MAX_STRIKES) {
-      ctx.ui.notify(
-        "chronobreak: generation loop detected, but strike limit (" + MAX_STRIKES + ") reached. Aborting without re-run.",
-        "error",
-      );
-    } else {
-      ctx.ui.notify(
-        'chronobreak: generation loop detected ("' + verdict.sample + '"). Re-running the turn.',
-        "warning",
-      );
-      pendingNudge = buildNudge(verdict.sample);
-    }
+    ctx.ui.notify(
+      'chronobreak: generation loop detected ("' + verdict.sample + '"). Re-running the turn.',
+      "warning",
+    );
+    pendingNudge = buildNudge(verdict.sample);
     ctx.abort();
   });
 
@@ -89,11 +79,5 @@ export default function (pi: ExtensionAPI): void {
     const nudge = pendingNudge;
     pendingNudge = undefined;
     pi.sendUserMessage(nudge, { deliverAs: "followUp" });
-  });
-
-  // User-driven input is a fresh direction: reset the strike counter.
-  pi.on("input", (event) => {
-    if (event.source === "extension") return;
-    strike = 0;
   });
 }

@@ -19,9 +19,9 @@
 ## Architecture
 
 - src/index.ts — the whole extension, decision-making: segmentize/scan (pure
-  functions: text in, loop verdict out), plus the imperative shell of five
+  functions: text in, loop verdict out), plus the imperative shell of four
   event handlers (message_start reset, message_update detect+abort,
-  message_end scrub, agent_end re-inject, input strike-reset). No extension
+  message_end scrub, agent_end re-inject). No extension
   boundary of its own: it is a spectator on pi's event API and never exposes
   state to the model.
 
@@ -40,7 +40,7 @@
 
 - Phase 1 — detection + termination: abort on >= 3 repeated normalized segments
   in one assistant message, scrub the aborted message, re-inject the nudge,
-  3-strike give-up. Criterion: nix build .#pi-chronobreak and nix flake check
+  no give-up (matches pi-flake: re-run on every loop). Criterion: nix build .#pi-chronobreak and nix flake check
   green; a live loop gets cut and the session shows the scrub marker.
 - Phase 2 — tuning: thresholds (repeat count, min chunk length) adjusted from
   real loops observed with the js-kernel sessions. Criterion: no false trigger

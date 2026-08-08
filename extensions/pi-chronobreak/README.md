@@ -14,15 +14,13 @@ line appears >= 3 times in one assistant message), it:
    (a single clean tool call or a direct answer), re-running the turn from a
    clean context.
 
-It gives up after 3 strikes per user turn to avoid an abort/re-run spin loop.
-
 chronobreak is a spectator: it never touches files or the JS kernel - it only
 aborts generation, replaces one assistant message, and queues a user message.
 
 ## Development
 
 Uses pi extension event API (message_start / message_update / message_end /
-agent_end / input). See DESIGN.md.
+agent_end). See DESIGN.md.
 
 Dev load: pi -e extensions/pi-chronobreak
 Lint: biome lint extensions/pi-chronobreak/src/index.ts
