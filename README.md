@@ -12,12 +12,13 @@ vendored here beyond nix glue:
   daemon, and subagent sessions; still active under `--no-extensions` since
   CLI-provided extension paths are always loaded). Extensions are preferred
   to patches because they don't rot on every `primeAgentSrc` bump.
-  - `repetition-loop-guard.ts` — "chronobreak": when streamed assistant text
-    degrades into a repetition loop (same sentence >= 3 times, or a periodic
-    phrase tail), it aborts the run, scrubs the message back to where the
-    repetition began (clean prefix and first occurrence kept, garbage
-    dropped), and re-injects a follow-up nudge so the turn re-runs from that
-    point. Gives up after 3 strikes per user turn.
+  - `pi-chronobreak/` — "chronobreak": when the model repeats the same output
+    over and over inside one turn (same normalized sentence/line >= 3 times),
+    it aborts the run, scrubs the polluted assistant message down to a one-line
+    marker, and re-injects a decisive-action directive (echoing the repeated
+    sample) that re-runs the turn from a clean context. Gives up after 3
+    strikes per user turn (abort + scrub only on the third, no re-run). This
+    mirrors the `pi-chronobreak` extension from [pi-flake](https://github.com/y0usaf/pi-flake).
 - `patches/` — minimal build-time patches applied to upstream (kept small:
   anything achievable via env var or an extension must not be a patch).
 - `nix/package-lock.json` — upstream's committed lockfile with `resolved` +
