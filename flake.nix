@@ -21,6 +21,11 @@
         # Build must not hit the network: drop `npm run generate-models` from
         # the ai build so the committed models.generated.ts is used as-is.
         ./patches/avoid-network-model-regeneration.patch
+        # Reap orphaned empty session files at daemon start (upstream PR #903,
+        # head f50fa1d8, not yet merged). Applies cleanly to the pinned rev
+        # because the touched files are unchanged between 0e0d23391 and the PR
+        # base a18809e0.
+        ./patches/reap-orphaned-sessions.patch
       ];
     in
     {
