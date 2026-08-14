@@ -1,0 +1,992 @@
+diff --git a/packages/coding-agent/src/core/keybindings.ts b/packages/coding-agent/src/core/keybindings.ts
+index a0762e44..91403862 100644
+--- a/packages/coding-agent/src/core/keybindings.ts
++++ b/packages/coding-agent/src/core/keybindings.ts
+@@ -59,6 +59,13 @@ export interface AppKeybindings {
+ 	"app.tree.filter.all": true;
+ 	"app.tree.filter.cycleForward": true;
+ 	"app.tree.filter.cycleBackward": true;
++
++	// Persistent agents/resume sidebar (left rail)
++	"app.sidebar.kill": true;
++	"app.sidebar.refresh": true;
++	"app.sidebar.search": true;
++	"app.sidebar.nextSession": true;
++	"app.sidebar.prevSession": true;
+ }
+ 
+ export type AppKeybinding = keyof AppKeybindings;
+@@ -198,6 +205,26 @@ export const KEYBINDINGS = {
+ 		defaultKeys: "shift+ctrl+o",
+ 		description: "Tree filter: cycle backward",
+ 	},
++	"app.sidebar.kill": {
++		defaultKeys: "x",
++		description: "Stop / kill the selected agent in the sidebar",
++	},
++	"app.sidebar.refresh": {
++		defaultKeys: "r",
++		description: "Force refresh the sidebar roster",
++	},
++	"app.sidebar.search": {
++		defaultKeys: "/",
++		description: "Filter the sidebar roster by session search",
++	},
++	"app.sidebar.nextSession": {
++		defaultKeys: "ctrl+j",
++		description: "Sidebar: jump to the next selectable session",
++	},
++	"app.sidebar.prevSession": {
++		defaultKeys: "ctrl+k",
++		description: "Sidebar: jump to the previous selectable session",
++	},
+ } as const satisfies KeybindingDefinitions;
+ 
+ const KEYBINDING_NAME_MIGRATIONS = {
+@@ -259,6 +286,11 @@ const KEYBINDING_NAME_MIGRATIONS = {
+ 	treeUnfoldOrDown: "app.tree.unfoldOrDown",
+ 	treeEditLabel: "app.tree.editLabel",
+ 	treeToggleLabelTimestamp: "app.tree.toggleLabelTimestamp",
++
++	sidebarRefresh: "app.sidebar.refresh",
++	sidebarSearch: "app.sidebar.search",
++	sidebarNextSession: "app.sidebar.nextSession",
++	sidebarPrevSession: "app.sidebar.prevSession",
+ } as const satisfies Record<string, Keybinding>;
+ 
+ function isRecord(value: unknown): value is Record<string, unknown> {
+diff --git a/packages/coding-agent/src/modes/interactive/agents-sidebar.ts b/packages/coding-agent/src/modes/interactive/agents-sidebar.ts
+new file mode 100644
+index 00000000..cd3a8275
+--- /dev/null
++++ b/packages/coding-agent/src/modes/interactive/agents-sidebar.ts
+@@ -0,0 +1,702 @@
++/**
++ * AgentsSidebar — persistent left rail for the interactive chat.
++ *
++ * Shows the same unified agent/resume roster as the full-screen agents view
++ * (live sessions + saved sessions + heartbeats), rendered compactly, and
++ * lets the user switch to another session in place via
++ * AgentConnection.switchSession (already handled by interactive-mode's
++ * session_replaced listener), kill live agents, or refresh.
++ *
++ * The component is rendered by the TUI's left-rail compositor; keyboard input
++ * is routed here by InteractiveMode through a TUI input listener while the
++ * sidebar is focused.
++ */
++
++import {
++	decodePrintableKey,
++	getKeybindings,
++	truncateToWidth,
++	visibleWidth,
++	type Component,
++} from "@earendil-works/pi-tui";
++import {
++	buildAgentsViewRows,
++	buildUnifiedSessionIndex,
++	filterUnifiedSessions,
++	reconcileUnifiedSessions,
++	sectionTitle,
++	shouldShowAgentsViewSession,
++	type AgentsViewRow,
++} from "../agents-view/agents-view-state.js";
++import { matchesSearchText } from "../agents-view/session-view-search.js";
++import { finalizeAgentsViewLine, renderAgentsViewRow } from "../agents-view/agents-view-render.js";
++import { resolveAgentsViewKeyAction } from "../agents-view/agents-view-actions.js";
++import { DaemonClient } from "../daemon/daemon-client.js";
++import { listDaemonHeartbeats } from "../daemon/heartbeat-catalog.js";
++import {
++	deleteDaemonSavedSession,
++	listDaemonSavedSessions,
++	renameDaemonSavedSession,
++	type DaemonSavedSessionCatalogContext,
++} from "../daemon/saved-session-catalog.js";
++import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
++import type { SessionSummary } from "../daemon/daemon-session-list.js";
++import { theme } from "./theme/theme.js";
++
++export interface AgentsSidebarOptions {
++	daemonSocketPath: string;
++	/** Cwd + optional session dir for scoping saved-session listing. */
++	cwd: string;
++	sessionDir?: string;
++	/** Live current session id (highlighted in the roster). */
++	getCurrentSessionId: () => string | undefined;
++	/** Fired when the user confirms a row: open/switch to that session. */
++	onOpenSession: (summary: SessionSummary) => void;
++	/** Fired when the user confirms the row that is already the current session. */
++	onCurrentSession?: () => void;
++	/** Fired when the user starts a new session (ctrl+n): switch the client in place. */
++	onNewSession?: () => void;
++	/** Show a transient status message (interactive-mode wires it to showStatus). */
++	onStatus?: (message: string, tone?: "dim" | "warning") => void;
++	/** Request a repaint (interactive-mode wires it to ui.requestRender). */
++	onRequestRender?: () => void;
++	/** Fired on dispose so the owner can tear down the rail. */
++	onDispose?: () => void;
++	/** Terminal height for windowing; defaults to process.stdout.rows. */
++	getRows?: () => number;
++}
++
++const POLL_INTERVAL_MS = 2000;
++const SAVED_POLL_INTERVAL_MS = 10000;
++
++export class AgentsSidebar implements Component {
++	// Component contract
++	render(width: number): string[] {
++		return this.renderRows(width);
++	}
++	invalidate(): void {
++		/* nothing cached */
++	}
++
++	private readonly client: DaemonClient;
++	private readonly options: AgentsSidebarOptions;
++	private pollTimer: ReturnType<typeof setInterval> | undefined;
++	private savedTimer: ReturnType<typeof setInterval> | undefined;
++	private disposed = false;
++	private activeSessionId: string | undefined;
++
++	private sessions: SessionSummary[] = [];
++	private savedSessions: AgentConnectionSavedSessionInfo[] = [];
++	private heartbeats: AgentConnectionHeartbeat[] = [];
++	private rows: AgentsViewRow[] = [];
++	private selectableRows: AgentsViewRow[] = [];
++	private selectedIndex = 0;
++	/** Live session-search query filter (empty = no filtering). */
++	private query = "";
++	/** True while the user is typing a search query in the rail. */
++	private searchActive = false;
++	private error: string | undefined;
++	private lastErrorAt = 0;
++	private pulseFrame = 0;
++	/** Subagent parents expanded inline (same set semantics as the agents view). */
++	private expandedSubagentParents = new Set<string>();
++	/** Inline rename input state (ctrl+r), mirroring the agents view. */
++	private renameSummary: SessionSummary | undefined;
++	private renameText = "";
++	/** Identity of the row under a two-step delete confirmation (ctrl+x). */
++	private pendingDeleteIdentity: string | undefined;
++
++	constructor(options: AgentsSidebarOptions) {
++		this.options = options;
++		this.client = new DaemonClient(options.daemonSocketPath);
++	}
++
++	/** Connect and start polling. Call once, after the TUI rail is set. */
++	async start(): Promise<void> {
++		try {
++			await this.client.connect();
++			await this.client.waitForHello();
++			await Promise.all([this.refresh(), this.refreshSavedSessions(), this.refreshHeartbeats()]);
++		} catch (error) {
++			this.setError(error);
++		}
++		this.pollTimer = setInterval(() => void this.refresh(), POLL_INTERVAL_MS);
++		this.savedTimer = setInterval(
++			() => void Promise.all([this.refreshSavedSessions(), this.refreshHeartbeats()]),
++			SAVED_POLL_INTERVAL_MS,
++		);
++		this.pollTimer.unref?.();
++		this.savedTimer.unref?.();
++	}
++
++	/** Current daemon active session id, if connected. */
++	getActiveSessionId(): string | undefined {
++		return this.activeSessionId;
++	}
++
++	/** Last non-transient error message, or undefined when healthy. */
++	getLastError(): string | undefined {
++		return this.error;
++	}
++
++	/** Force an immediate refresh of the live roster (list + saved + heartbeats). */
++	async refreshNow(): Promise<void> {
++		await Promise.all([this.refresh(), this.refreshSavedSessions(), this.refreshHeartbeats()]);
++	}
++
++	private setError(error: unknown): void {
++		const message = error instanceof Error ? error.message : String(error);
++		// Coalesce identical errors so the rail doesn't thrash on a dead daemon.
++		if (message !== this.error || Date.now() - this.lastErrorAt > 5000) {
++			this.error = message;
++			this.lastErrorAt = Date.now();
++		}
++	}
++
++	private getSavedSessionContext(): DaemonSavedSessionCatalogContext {
++		return { cwd: this.options.cwd, sessionDir: this.options.sessionDir };
++	}
++
++	private async refresh(): Promise<void> {
++		if (this.disposed || !this.client.isConnected) return;
++		try {
++			const response = await this.client.request({ type: "list" });
++			if (this.disposed || !response.success) {
++				if (!response.success) this.setError(response.error ?? "list failed");
++				return;
++			}
++			const data = response.data as { sessions: SessionSummary[]; busyClientOwnedSessionCount?: number };
++			this.sessions = data.sessions ?? [];
++			this.error = undefined;
++			this.reconcile();
++			// Also pick up the active-session id of whatever we're attached to.
++			this.activeSessionId =
++				data.sessions.find((s) => s.sessionId === this.options.getCurrentSessionId())?.activeSessionId ??
++				this.activeSessionId;
++		} catch (error) {
++			this.setError(error);
++		}
++	}
++
++	private async refreshSavedSessions(): Promise<void> {
++		if (this.disposed || !this.client.isConnected) return;
++		try {
++			this.savedSessions = await listDaemonSavedSessions(this.client, this.getSavedSessionContext(), "all");
++			this.reconcile();
++		} catch (error) {
++			this.setError(error);
++		}
++	}
++
++	private async refreshHeartbeats(): Promise<void> {
++		if (this.disposed || !this.client.isConnected) return;
++		try {
++			this.heartbeats = await listDaemonHeartbeats(this.client);
++			this.reconcile();
++		} catch {
++			/* heartbeats are optional; keep last known */
++		}
++	}
++
++	private reconcile(): void {
++		const visible = this.sessions.filter((s) => shouldShowAgentsViewSession(s));
++		const records = reconcileUnifiedSessions(visible, this.savedSessions, this.heartbeats);
++		buildUnifiedSessionIndex(records);
++		// Apply the live session-search filter. filterUnifiedSessions retains
++		// ancestor rows of any match, so a hit deep in the roster still shows
++		// its parent chain (same behaviour as the full agents view).
++		const query = this.query.trim();
++		const scoped = query ? filterUnifiedSessions(records, (text) => matchesSearchText(text, query)) : records;
++		this.rows = buildAgentsViewRows(scoped, this.expandedSubagentParents);
++		this.selectableRows = this.rows.filter((row) => row.selectable);
++		if (this.selectedIndex >= this.selectableRows.length) {
++			this.selectedIndex = Math.max(0, this.selectableRows.length - 1);
++		}
++	}
++
++	/** Mark the current session (after a session_replaced switch). */
++	updateCurrentSession(sessionId: string | undefined): void {
++		if (sessionId !== this.options.getCurrentSessionId()) {
++			// no external state to update; activeSessionId refresh happens on poll
++		}
++	}
++
++	// ---- keyboard ----
++
++	/** Handle one input chunk while the sidebar has focus. Returns true if consumed. */
++	handleInput(data: string): boolean {
++		const kb = getKeybindings();
++
++		// Inline rename input: escape cancels, Enter confirms, text appends.
++		if (this.renameSummary) {
++			if (kb.matches(data, "tui.select.cancel")) {
++				this.cancelRename();
++				return true;
++			}
++			if (kb.matches(data, "tui.select.confirm")) {
++				void this.confirmRename();
++				return true;
++			}
++			if (kb.matches(data, "tui.editor.deleteCharBackward")) {
++				this.renameText = this.renameText.slice(0, -1);
++				this.options.onRequestRender?.();
++				return true;
++			}
++			const ch = decodePrintableKey(data);
++			if (ch !== undefined || data === " ") {
++				this.renameText += ch ?? " ";
++				this.options.onRequestRender?.();
++				return true;
++			}
++			return true;
++		}
++
++		// Search input: printable text filters the roster live (agents-view
++		// parity — the rail's search bar behaves like the view's search editor).
++		if (this.searchActive) {
++			if (kb.matches(data, "tui.select.cancel")) {
++				this.clearSearch();
++				return true;
++			}
++			if (kb.matches(data, "tui.editor.deleteCharBackward")) {
++				this.setQuery(this.query.slice(0, -1));
++				return true;
++			}
++			if (kb.matches(data, "tui.input.copy")) {
++				return true; // swallow ctrl+c so it doesn't fall through
++			}
++			const ch = decodePrintableKey(data);
++			if (ch !== undefined || data === " ") {
++				this.setQuery(this.query + (ch ?? " "));
++				return true;
++			}
++			// fall through to the shared dispatcher for navigation/actions
++		}
++
++		// Sidebar-only binds: search toggle.
++		if (kb.matches(data, "app.sidebar.search")) {
++			this.setSearchActive(!this.searchActive);
++			return true;
++		}
++		// Enter while a search filter is active commits the filter instead of
++		// selecting a session — search stays filtered, no accidental switch.
++		if (kb.matches(data, "tui.select.confirm")) {
++			if (this.query.trim()) {
++				this.setSearchActive(false);
++				return true;
++			}
++			this.openSelected();
++			return true;
++		}
++
++		// Shared dispatch: same keys as the full agents view (ctrl+n new,
++		// ctrl+x delete, ctrl+r rename, space reply, ctrl+o program, open,
++		// up/down/page navigation, clear). One dispatch implementation.
++		const action = resolveAgentsViewKeyAction(data, kb, {
++			textEmpty: this.query.trim().length === 0,
++			renameActive: this.renameSummary !== undefined,
++			replyActive: false,
++			searchCursorAtEnd: true,
++			visibleRows: Math.max(1, this.getRows()),
++			searchActive: this.searchActive,
++		});
++		switch (action.type) {
++			case "rename":
++				this.enterRenameMode();
++				return true;
++			case "delete":
++				void this.handleDelete();
++				return true;
++			case "reply":
++				// The rail has no reply composer; replies stay on the full view.
++				return true;
++			case "new":
++				this.options.onNewSession?.();
++				return true;
++			case "program":
++				// Program cycling is a full-view feature.
++				return true;
++			case "open":
++				this.openSelected();
++				return true;
++			case "clear":
++				this.clearSearch();
++				return true;
++			case "nav":
++				this.moveSelection(action.delta);
++				return true;
++			case "cancel":
++				if (this.renameSummary) {
++					this.cancelRename();
++				} else if (this.searchActive) {
++					this.clearSearch();
++				}
++				return true;
++			case "search-commit":
++				this.setSearchActive(false);
++				return true;
++			case "text":
++				// Typing outside search mode starts a search (agents-view parity).
++				if (!this.searchActive) {
++					this.setSearchActive(true);
++				}
++				this.setQuery(this.query + action.data);
++				return true;
++			default:
++				return false;
++		}
++	}
++
++	/** Set the live search filter query and re-reconcile the roster. */
++	setQuery(query: string): void {
++		this.query = query;
++		this.reconcile();
++	}
++
++	/** Enter/exit live search-edit mode without clearing the current filter. */
++	setSearchActive(active: boolean): void {
++		this.searchActive = active;
++	}
++
++	/** Clear the search filter and exit search-edit mode. */
++	clearSearch(): void {
++		this.query = "";
++		this.searchActive = false;
++		this.reconcile();
++	}
++
++	/** True while the user is editing the search filter in the rail. */
++	getSearchActive(): boolean {
++		return this.searchActive;
++	}
++
++	/** Current search filter text (empty when no filter is applied). */
++	getQuery(): string {
++		return this.query;
++	}
++
++	/** Kill the selected live agent (daemon kill command). */
++	async killSelected(): Promise<boolean> {
++		const row = this.selectableRows[this.selectedIndex];
++		if (!row?.summary?.activeSessionId) return false;
++		try {
++			const response = await this.client.request({
++				type: "kill",
++				activeSessionId: row.summary.activeSessionId,
++			});
++			if (!response.success) {
++				this.setError(response.error ?? "kill failed");
++				return false;
++			}
++			await this.refresh();
++			return true;
++		} catch (error) {
++			this.setError(error);
++			return false;
++		}
++	}
++
++	/** Open/switch to the selected session. */
++	openSelected(): void {
++		const row = this.selectableRows[this.selectedIndex];
++		if (!row) return;
++		// A collapsed subagent summary expands into its rows instead of opening
++		// a session — same behaviour as the full-screen agents view.
++		if (row.kind === "subagent-summary" && row.parentIdentity) {
++			this.expandSubagentList(row);
++			return;
++		}
++		const summary = row.summary;
++		const current = this.options.getCurrentSessionId();
++		if (current && summary.sessionId === current) {
++			this.options.onCurrentSession?.();
++			return; // already here
++		}
++		this.options.onOpenSession(summary);
++	}
++
++	/** Expand a collapsed subagent list and select its first child. */
++	private expandSubagentList(row: AgentsViewRow): void {
++		if (!row.parentIdentity) return;
++		this.expandedSubagentParents.add(row.parentIdentity);
++		this.reconcile();
++		const firstChild = this.selectableRows.findIndex(
++			(candidate) => candidate.kind === "subagent" && candidate.parentIdentity === row.parentIdentity,
++		);
++		if (firstChild >= 0) {
++			this.selectedIndex = firstChild;
++		}
++		this.options.onRequestRender?.();
++	}
++
++	/** Collapse any expanded subagent list once the selection moves outside it. */
++	private collapseSubagentListsOutsideSelection(): void {
++		if (this.expandedSubagentParents.size === 0) return;
++		const selectedRow = this.selectableRows[this.selectedIndex];
++		const keep = new Set<string>();
++		if (selectedRow && this.expandedSubagentParents.has(selectedRow.identity)) {
++			keep.add(selectedRow.identity);
++		}
++		let parentIdentity = selectedRow?.parentIdentity;
++		while (parentIdentity !== undefined && !keep.has(parentIdentity)) {
++			keep.add(parentIdentity);
++			const target = parentIdentity;
++			parentIdentity = this.selectableRows.find((row) => row.identity === target)?.parentIdentity;
++		}
++		const next = new Set([...this.expandedSubagentParents].filter((identity) => keep.has(identity)));
++		if (next.size === this.expandedSubagentParents.size) return;
++		this.expandedSubagentParents = next;
++		this.reconcile();
++	}
++
++	/** Move the selection by a delta, clamping and auto-collapsing stale expansions. */
++	private moveSelection(delta: number): void {
++		if (this.selectableRows.length === 0) return;
++		this.selectedIndex =
++			(this.selectedIndex + delta + this.selectableRows.length) % this.selectableRows.length;
++		this.collapseSubagentListsOutsideSelection();
++		this.advancePulse();
++	}
++
++	/** Begin an inline rename of the selected session (ctrl+r). */
++	private enterRenameMode(): void {
++		const row = this.selectableRows[this.selectedIndex];
++		if (!row) return;
++		this.renameSummary = row.summary;
++		this.renameText = row.title ?? "";
++		this.options.onRequestRender?.();
++	}
++
++	private cancelRename(): void {
++		this.renameSummary = undefined;
++		this.renameText = "";
++		this.options.onRequestRender?.();
++	}
++
++	private async confirmRename(): Promise<void> {
++		const summary = this.renameSummary;
++		const name = this.renameText.trim();
++		this.renameSummary = undefined;
++		this.renameText = "";
++		this.options.onRequestRender?.();
++		if (!summary || !name) return;
++		try {
++			if (summary.activeSessionId) {
++				const response = await this.client.request({
++					type: "rename",
++					activeSessionId: summary.activeSessionId,
++					name,
++				});
++				if (!response.success) {
++					this.options.onStatus?.(response.error ?? "Rename failed", "warning");
++					return;
++				}
++			} else if (summary.sessionFile) {
++				await renameDaemonSavedSession(this.client, this.getSavedSessionContext(), summary.sessionFile, name);
++			} else {
++				this.options.onStatus?.("This session cannot be renamed", "warning");
++				return;
++			}
++			await this.refreshSavedSessions();
++			this.options.onStatus?.(`Renamed to ${name}`, "dim");
++			this.options.onRequestRender?.();
++		} catch (error) {
++			this.setError(error);
++			this.options.onStatus?.(error instanceof Error ? error.message : String(error), "warning");
++			this.options.onRequestRender?.();
++		}
++	}
++
++	/** Two-step delete (ctrl+x): stop a live agent or remove a saved session. */
++	private async handleDelete(): Promise<void> {
++		const row = this.selectableRows[this.selectedIndex];
++		if (!row?.selectable) return;
++		if (row.summary.sessionId === this.options.getCurrentSessionId()) {
++			this.options.onStatus?.("Cannot delete the current session", "warning");
++			return;
++		}
++		const identity = row.identity;
++		if (this.pendingDeleteIdentity === identity) {
++			// confirmed second press — perform the delete/stop
++			this.pendingDeleteIdentity = undefined;
++			this.options.onRequestRender?.();
++			if (row.summary.activeSessionId) {
++				const ok = await this.killSelected();
++				this.options.onStatus?.(
++					ok ? "Agent stopped" : (this.getLastError() ?? "Failed to stop agent"),
++					ok ? "dim" : "warning",
++				);
++				return;
++			}
++			if (row.summary.sessionFile) {
++				try {
++					await deleteDaemonSavedSession(this.client, this.getSavedSessionContext(), row.summary.sessionFile);
++					await this.refreshSavedSessions();
++					this.options.onStatus?.("Session deleted", "dim");
++				} catch (error) {
++					this.setError(error);
++					this.options.onStatus?.(error instanceof Error ? error.message : String(error), "warning");
++				}
++				this.options.onRequestRender?.();
++				return;
++			}
++			return;
++		}
++		// first press — arm the confirmation
++		this.pendingDeleteIdentity = identity;
++		this.options.onStatus?.(
++			row.summary.activeSessionId
++				? "Press ctrl+x again to stop this agent"
++				: "Press ctrl+x again to delete this session",
++			"warning",
++		);
++		this.options.onRequestRender?.();
++	}
++
++	getSelectedSummary(): SessionSummary | undefined {
++		return this.selectableRows[this.selectedIndex]?.summary;
++	}
++
++	// ---- rendering ----
++
++	private renderRows(width: number): string[] {
++		const rows = this.getRows();
++		// Full terminal height so the rail column runs to the bottom row; a
++		// rows-1 rail leaves the last visible row with a blank rail slot.
++		const maxLines = Math.max(4, rows);
++		this.advancePulse();
++		// The last column is the right-edge rail (pi-harness style separator).
++		const innerWidth = Math.max(4, width - 1);
++		const out: string[] = [];
++
++		// header
++		out.push(theme.bold(theme.fg("accent", truncateToWidth(" agents", innerWidth))));
++		out.push(theme.fg("borderMuted", "─".repeat(Math.max(0, innerWidth))));
++
++		// rename line: a live inline input that replaces the search row while a
++		// rename is in progress (mirrors the agents view's rename editor).
++		if (this.renameSummary) {
++			const cursor = this.pulseFrame % 2 === 0 ? "▌" : " ";
++			out.push(theme.fg("accent", truncateToWidth(` rn ${this.renameText}${cursor}`, innerWidth)));
++		} else if (this.searchActive) {
++			const prompt = "/ ";
++			const cursor = this.pulseFrame % 2 === 0 ? "▌" : " ";
++			out.push(truncateToWidth(`${prompt}${this.query}${cursor}`, innerWidth));
++		} else if (this.query.trim()) {
++			out.push(theme.fg("muted", truncateToWidth(` ⌕ ${this.query}`, innerWidth)));
++		}
++
++		if (this.error) {
++			out.push(theme.fg("error", truncateToWidth(` ! ${this.error}`, innerWidth)));
++		}
++
++		const total = this.selectableRows.length;
++		// The visible window must fit `maxLines` exactly; rows AND the section
++		// headers that introduce them count against the budget. Without this, a
++		// roster spanning many sections renders more lines than the terminal
++		// and the TUI rail compositor appends the excess to the frame, shifting
++		// the whole window upward (and slicing raw ANSI mid-sequence).
++		const bodyBudget = Math.max(0, maxLines - out.length);
++		// Leave one line for the "↓ N more" indicator whenever the list
++		// overflows; when the whole list fits, the reserved slot is simply
++		// unused padding.
++		const windowBudget = Math.max(1, bodyBudget - 1);
++		// How many lines rows [from, to) render, counting section headers.
++		const windowLines = (from: number, to: number): number => {
++			let lines = 0;
++			let section: string | undefined;
++			for (let i = from; i < to; i++) {
++				if (this.selectableRows[i]!.section !== section) {
++					lines += 1;
++					section = this.selectableRows[i]!.section;
++				}
++				lines += 1;
++			}
++			return lines;
++		};
++		// Center the selection, then slide the start forward until the
++		// selection (with its section header) fits, so the focused row is
++		// always visible.
++		let start = Math.max(0, Math.min(this.selectedIndex - Math.floor(windowBudget / 2), Math.max(0, total - 1)));
++		while (start < this.selectedIndex && windowLines(start, this.selectedIndex + 1) > windowBudget) {
++			start += 1;
++		}
++		let end = start;
++		let used = 0;
++		let currentSection: string | undefined;
++		for (let i = start; i < total; i++) {
++			const row = this.selectableRows[i];
++			const add = (row.section !== currentSection ? 1 : 0) + 1;
++			if (used + add > windowBudget) break;
++			currentSection = row.section;
++			used += add;
++			end = i + 1;
++		}
++
++		currentSection = undefined;
++		for (let i = Math.max(0, start); i < end; i++) {
++			const row = this.selectableRows[i];
++			if (row.section !== currentSection) {
++				currentSection = row.section;
++				out.push(theme.fg("dim", truncateToWidth(` ${sectionTitle(row.section)}`, innerWidth)));
++			}
++			out.push(this.renderRow(row, i === this.selectedIndex, innerWidth));
++		}
++		if (end < total) {
++			out.push(theme.fg("muted", truncateToWidth(` ↓ ${total - end} more`, innerWidth)));
++		}
++
++		// The rail character itself is drawn in the reverse-video colour (the
++		// light foreground), not the whole cell inverted — so it reads as a
++		// clean light `│` line rather than a solid block.
++		const rail = theme.fg("text", "│");
++		while (out.length < maxLines) {
++			// Pad to full rendered width so the rail is a continuous column.
++			out.push(" ".repeat(innerWidth));
++		}
++		// Append the right-edge rail to every row (header, sections, blanks),
++		// padding short lines (header text, section titles) to the full content
++		// width first so the rail always aligns at the sidebar's right edge.
++		return out.map((line) => {
++			const clipped = truncateToWidth(line, innerWidth, "", false);
++			return clipped + " ".repeat(Math.max(0, innerWidth - visibleWidth(clipped))) + rail;
++		});
++	}
++
++	// Rendered through the shared agents-view row renderer so the sidebar is
++	// literally the agents/resume view, compressed to rail width: the same rows
++	// (icon, styled title, summary suffix, age/details column) the full screen
++	// renders, just truncated to fit the rail. One render path, no drift.
++	private renderRow(row: AgentsViewRow, selected: boolean, width: number): string {
++		const line = renderAgentsViewRow(row, {
++			width,
++			selected,
++			workingIconFrame: this.pulseFrame,
++			highlightCurrentSessionId: this.options.getCurrentSessionId(),
++		});
++		return finalizeAgentsViewLine(line, width);
++	}
++
++	// ---- lifecycle ----
++
++	dispose(): void {
++		if (this.disposed) return;
++		this.disposed = true;
++		if (this.pollTimer) clearInterval(this.pollTimer);
++		if (this.savedTimer) clearInterval(this.savedTimer);
++		try {
++			this.client.close();
++		} catch {
++			/* ignore */
++		}
++		this.options.onDispose?.();
++	}
++
++	private getRows(): number {
++		return this.options.getRows?.() ?? process.stdout.rows ?? 24;
++	}
++
++	private advancePulse(): void {
++		this.pulseFrame = (this.pulseFrame + 1) % 4;
++	}
++}
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index ccfef6a4..277d5c1a 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -34,6 +34,7 @@ import {
+ 	CombinedAutocompleteProvider,
+ 	type Component,
+ 	Container,
++	getKeybindings,
+ 	Loader,
+ 	type LoaderIndicatorOptions,
+ 	Markdown,
+@@ -252,6 +253,8 @@ import {
+ 	theme,
+ } from "./theme/theme.js";
+ import { setWorkingPulseFrame, WORKING_ICON_INTERVAL_MS } from "./theme/working-icon.js";
++import { AgentsSidebar } from "./agents-sidebar.js";
++import type { SessionSummary } from "../daemon/daemon-session-list.js";
+ 
+ /** Interface for components that can be expanded/collapsed */
+ interface Expandable {
+@@ -268,6 +271,8 @@ const HEARTBEAT_LEGACY_PROMPT_MIN_TOLERANCE_MS = 15_000;
+ const HEARTBEAT_LEGACY_PROMPT_MAX_TOLERANCE_MS = 120_000;
+ const MODEL_CATALOG_REFRESH_TTL_MS = 60_000;
+ const FEATURE_HINT_DELAY_MS = 5_000;
++/** Width (columns) of the persistent agents/resume left rail. */
++const SIDEBAR_WIDTH = 30;
+ 
+ export const START_HINTS = [
+ 	'Try "refactor @<filepath>"',
+@@ -852,6 +857,10 @@ export class InteractiveMode {
+ 	private readonly retainedSubmissionGenerations = new WeakMap<PromptStash, number>();
+ 	private admitPendingStartupPrompts: (() => Promise<StartupPromptBarrierOutcome>) | undefined;
+ 	private agentsViewRequest: InteractiveModeRunResult["type"] | undefined;
++	/** Persistent agents/resume left rail (daemon-backed sessions only). */
++	private agentsSidebar: AgentsSidebar | undefined;
++	private agentsSidebarFocused = false;
++	private unsubscribeAgentsSidebarInput: (() => void) | undefined;
+ 	private loadingAnimation: Loader | undefined = undefined;
+ 	private workingMessage: string | undefined = undefined;
+ 	private workingVisible = true;
+@@ -1408,6 +1417,8 @@ export class InteractiveMode {
+ 		this.ui.addChild(this.mainContainer);
+ 		this.ui.setFocus(this.editor);
+ 
++		this.setupAgentsSidebar();
++
+ 		this.setupKeyHandlers();
+ 		this.setupEditorSubmitHandler();
+ 
+@@ -6707,10 +6718,141 @@ export class InteractiveMode {
+ 		stopThemeWatcher();
+ 	}
+ 
++	/**
++	 * Mount the persistent agents/resume sidebar as the TUI's left rail.
++	 * Only meaningful in daemon-backed mode (a daemon socket is required to
++	 * poll the roster). Keyboard focus in the editor is untouched; the rail is
++	 * navigable via focusAgentsSidebar().
++	 */
++	private setupAgentsSidebar(): void {
++		if (!this.options.daemonSocketPath) return;
++		if (this.agentsSidebar) return;
++		const sidebar = new AgentsSidebar({
++			daemonSocketPath: this.options.daemonSocketPath,
++			cwd: this.getCurrentCwd(),
++			sessionDir: this.connectionState?.sessionDir,
++			getCurrentSessionId: () => this.connectionState?.sessionId,
++			onOpenSession: (summary) => void this.openAgentsSidebarSession(summary),
++			onCurrentSession: () => {
++				this.showStatus("Already in this session");
++				this.unfocusAgentsSidebar();
++			},
++			onNewSession: () => void this.newSessionFromSidebar(),
++			onStatus: (message, tone) => this.showStatus(message, tone),
++			onRequestRender: () => this.ui.requestRender(),
++		});
++		this.agentsSidebar = sidebar;
++		this.ui.setLeftRail(sidebar, SIDEBAR_WIDTH);
++		// Route keys to the sidebar only while it is focused; everything else
++		// flows through to the editor untouched.
++		this.unsubscribeAgentsSidebarInput = this.ui.addInputListener((data: string) => {
++			if (!this.agentsSidebarFocused || !this.agentsSidebar) return undefined;
++			const kb = getKeybindings();
++			if (kb.matches(data, "app.sidebar.kill")) {
++				this.agentsSidebarFocused = false;
++				this.ui.requestRender();
++				void this.killSelectedAgentsSidebar();
++				return { consume: true };
++			}
++			if (kb.matches(data, "app.sidebar.refresh")) {
++				void this.agentsSidebar?.refreshNow?.()?.then(() => this.ui.requestRender());
++				return { consume: true };
++			}
++			const consumed = this.agentsSidebar.handleInput(data);
++			if (consumed) {
++				this.ui.requestRender();
++				return { consume: true };
++			}
++			// Escape / left-arrow within the focused rail returns to the editor.
++			if (kb.matches(data, "tui.select.cancel") || kb.matches(data, "app.agents.back")) {
++				this.unfocusAgentsSidebar();
++				return { consume: true };
++			}
++			return undefined;
++		});
++		void sidebar.start();
++	}
++
++	/** Move keyboard focus into the sidebar (empty draft required). */
++	private focusAgentsSidebar(): boolean {
++		if (!this.agentsSidebar) return false;
++		if (this.editor.getText().trim()) {
++			this.showStatus("Send, stash, or clear your draft before browsing agents");
++			return true;
++		}
++		this.agentsSidebarFocused = true;
++		this.ui.requestRender();
++		return true;
++	}
++
++	private unfocusAgentsSidebar(): void {
++		if (!this.agentsSidebarFocused) return;
++		this.agentsSidebarFocused = false;
++		this.ui.requestRender();
++	}
++
++	/** Switch the current connection to the chosen session (in place). */
++	private async openAgentsSidebarSession(summary: SessionSummary): Promise<void> {
++		this.unfocusAgentsSidebar();
++		const sessionFile = summary.sessionFile;
++		if (!sessionFile) {
++			this.showStatus("Cannot resume a session without a saved session file", "warning");
++			return;
++		}
++		try {
++			await this.agentConnection.switchSession(sessionFile, {
++				cwdOverride: this.getCurrentCwd(),
++			});
++		} catch (error) {
++			this.showStatus(error instanceof Error ? error.message : String(error), "warning");
++		}
++	}
++
++	/** Start a new session from the sidebar (ctrl+n): switch the client in place. */
++	private async newSessionFromSidebar(): Promise<void> {
++		this.unfocusAgentsSidebar();
++		try {
++			await this.agentConnection.newSession();
++		} catch (error) {
++			this.showStatus(error instanceof Error ? error.message : String(error), "warning");
++		}
++	}
++
++	private async killSelectedAgentsSidebar(): Promise<void> {
++		if (!this.agentsSidebar) return;
++		const summary = this.agentsSidebar.getSelectedSummary();
++		if (!summary) return;
++		if (summary.sessionId === this.connectionState?.sessionId) {
++			this.showStatus("Cannot kill the current session");
++			return;
++		}
++		const ok = await this.agentsSidebar.killSelected();
++		this.showStatus(
++			ok ? "Agent stopped" : (this.agentsSidebar.getLastError?.() ?? "Kill failed"),
++			ok ? "dim" : "warning",
++		);
++		this.ui.requestRender();
++	}
++
++	private teardownAgentsSidebar(): void {
++		this.unsubscribeAgentsSidebarInput?.();
++		this.unsubscribeAgentsSidebarInput = undefined;
++		this.agentsSidebar?.dispose();
++		this.agentsSidebar = undefined;
++		this.agentsSidebarFocused = false;
++		this.ui.setLeftRail(null);
++	}
++
+ 	private handleAgentsBack(): boolean {
+ 		if (this.editor.getText().trim()) {
+ 			return false;
+ 		}
++		// With the persistent rail mounted, left arrow focuses it instead of
++		// tearing down to the full-screen agents view.
++		if (this.agentsSidebar) {
++			this.focusAgentsSidebar();
++			return true;
++		}
+ 		if (!this.options.returnToAgentsView) {
+ 			void this.requestAgentsView();
+ 			return true;
+@@ -9424,6 +9566,11 @@ ${shortcutsKey ? `\`${shortcutsKey}\` quick shortcuts · ` : ""}\`/hotkeys\` ful
+ 	}
+ 
+ 	private getHotkeysGuide(): string {
++		const sidebarSearch = this.getAppKeyDisplay("app.sidebar.search");
++		const sidebarNext = this.getAppKeyDisplay("app.sidebar.nextSession");
++		const sidebarPrev = this.getAppKeyDisplay("app.sidebar.prevSession");
++		const sidebarKill = this.getAppKeyDisplay("app.sidebar.kill");
++		const sidebarRefresh = this.getAppKeyDisplay("app.sidebar.refresh");
+ 		const cursorUp = this.getEditorKeyDisplay("tui.editor.cursorUp");
+ 		const cursorDown = this.getEditorKeyDisplay("tui.editor.cursorDown");
+ 		const cursorLeft = this.getEditorKeyDisplay("tui.editor.cursorLeft");
+@@ -9518,6 +9665,14 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
+ | \`${viewportFollow}\` | Scroll to bottom and follow output |
+ | mouse wheel | Scroll transcript |
+ | mouse drag | Select and copy text |
++
++**Sidebar (agents/resume, \`/agents\`)**
++| Key | Action |
++|-----|--------|
++| \`${sidebarSearch}\` | Filter the roster by session search |
++| \`${sidebarNext}\` / \`${sidebarPrev}\` | Jump to the next / previous session |
++| \`${sidebarKill}\` | Stop / kill the selected agent |
++| \`${sidebarRefresh}\` | Force-refresh the roster |
+ `;
+ 
+ 		const shortcuts = this.bindLocalSessionExtensions
+@@ -9674,6 +9829,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
+ 		this.stopGoalTrayTimer();
+ 		this.closeHeartbeatManager();
+ 		this.clearExtensionTerminalInputListeners();
++		this.teardownAgentsSidebar();
+ 		this.footer.dispose();
+ 		this.footerDataProvider.dispose();
+ 		if (this.unsubscribe) {

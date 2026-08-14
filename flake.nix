@@ -26,6 +26,39 @@
         # because the touched files are unchanged between 0e0d23391 and the PR
         # base a18809e0.
         ./patches/reap-orphaned-sessions.patch
+        # Persistent agents/resume left sidebar: reserve left columns in the
+        # TUI render pipeline and composite a rail component over them
+        # (setLeftRail). Client-local; no daemon protocol changes.
+        ./patches/tui-left-rail.patch
+        # Shared roster logic first: extract the agents-view row rendering into
+        # one pure module (agents-view-render.ts) plus a shared key-action
+        # dispatcher (agents-view-actions.ts) that BOTH the full agents/resume
+        # view and the sidebar drive. The sidebar is literally the agents view
+        # compressed to rail width — same rows, same keys (ctrl+n new, ctrl+x
+        # delete, ctrl+r rename, space reply, ctrl+o program, up/down/page,
+        # search-as-you-type). One render path and one key dispatch instead of
+        # two divergent implementations.
+        ./patches/agents-view-shared-rendering.patch
+        # AgentsSidebar component + interactive-mode integration: poll the
+        # daemon roster (list/saved/heartbeats), render the rail, and route
+        # keys through the shared dispatcher — left arrow focuses it, Enter
+        # switches sessions in place, x kills, r refreshes, "/" filters, and
+        # the full agents-view keybinding set (ctrl+n/x/r/space/ctrl+o) works
+        # in the rail. Includes the app.sidebar.* keybinding registration.
+        ./patches/coding-agent-agents-sidebar.patch
+        # Layout overlays (autocomplete "/", "@", centered modals, model
+        # picker) inside the content area so they don't render underneath the
+        # left rail. resolveOverlayLayout becomes rail-aware (width, anchor and
+        # aboveMarker columns are shifted right / shrunk by the rail width).
+        ./patches/tui-overlay-rail.patch
+        # Sidebar on/off toggle: app.sidebar.toggle keybinding (ctrl+s) plus a
+        # /sidebar [on|off] slash command that show/hide the left rail in place
+        # (keeps the AgentsSidebar polling; re-attaches the rail on show). The
+        # toggle works both from the editor (focus-aware onAction) and while the
+        # rail itself is focused. When the rail is toggled off, the agents.back
+        # (left arrow) handoff falls through to the full-screen agents/resume
+        # view (requestAgentsView) so the agents/resume path stays reachable.
+        ./patches/sidebar-toggle.patch
       ];
     in
     {
@@ -130,7 +163,7 @@
               mkdir -p $out/lib/prime-agent/extensions
               cp -a ${./extensions/pi-chronobreak} $out/lib/prime-agent/extensions/pi-chronobreak
               chmod +x $out/lib/prime-agent/prime-agent.sh
-              makeWrapper ${pkgs.nodejs_22}/bin/node $out/bin/prime-agent                 --add-flags "$out/lib/prime-agent/packages/coding-agent/dist/bundle/cli.js --extension $out/lib/prime-agent/extensions/pi-chronobreak"                 --prefix PATH : ${pkgs.nodejs_22}/bin                 --set-default PRIME_AGENT_KERNEL_PYTHON ${kernelPython}/bin/python                 --set PI_SKIP_VERSION_CHECK 1
+              makeWrapper ${pkgs.nodejs_22}/bin/node $out/bin/prime-agent                 --add-flags "$out/lib/prime-agent/packages/coding-agent/dist/bundle/cli.js --extension $out/lib/prime-agent/extensions/pi-chronobreak"                 --prefix PATH : ${pkgs.nodejs_22}/bin                 --set-default PRIME_AGENT_KERNEL_PYTHON ${kernelPython}/bin/python                 --set-default RLM_MAX_DEPTH 10                 --set PI_SKIP_VERSION_CHECK 1
               runHook postInstall
             '';
 

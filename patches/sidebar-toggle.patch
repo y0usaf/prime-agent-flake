@@ -1,0 +1,161 @@
+diff --git a/packages/coding-agent/src/core/keybindings.ts b/packages/coding-agent/src/core/keybindings.ts
+index c4271fda..a01c7ec8 100644
+--- a/packages/coding-agent/src/core/keybindings.ts
++++ b/packages/coding-agent/src/core/keybindings.ts
+@@ -66,6 +66,7 @@ export interface AppKeybindings {
+ 	"app.sidebar.search": true;
+ 	"app.sidebar.nextSession": true;
+ 	"app.sidebar.prevSession": true;
++	"app.sidebar.toggle": true;
+ }
+ 
+ export type AppKeybinding = keyof AppKeybindings;
+@@ -225,6 +226,10 @@ export const KEYBINDINGS = {
+ 		defaultKeys: "ctrl+k",
+ 		description: "Sidebar: jump to the previous selectable session",
+ 	},
++	"app.sidebar.toggle": {
++		defaultKeys: "ctrl+s",
++		description: "Toggle the agents/resume sidebar on/off",
++	},
+ } as const satisfies KeybindingDefinitions;
+ 
+ const KEYBINDING_NAME_MIGRATIONS = {
+@@ -291,6 +296,7 @@ const KEYBINDING_NAME_MIGRATIONS = {
+ 	sidebarSearch: "app.sidebar.search",
+ 	sidebarNextSession: "app.sidebar.nextSession",
+ 	sidebarPrevSession: "app.sidebar.prevSession",
++	sidebarToggle: "app.sidebar.toggle",
+ } as const satisfies Record<string, Keybinding>;
+ 
+ function isRecord(value: unknown): value is Record<string, unknown> {
+
+diff --git a/packages/coding-agent/src/core/slash-commands.ts b/packages/coding-agent/src/core/slash-commands.ts
+index a3478361..9f523fae 100644
+--- a/packages/coding-agent/src/core/slash-commands.ts
++++ b/packages/coding-agent/src/core/slash-commands.ts
+@@ -193,6 +193,12 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
+ 		argumentHint: "[on|off]",
+ 		takesArgument: true,
+ 	},
++	{
++		name: "sidebar",
++		description: "Toggle the agents/resume sidebar on/off",
++		argumentHint: "[on|off]",
++		takesArgument: true,
++	},
+ 	{ name: "quit", description: `Quit ${APP_NAME}` },
+ ];
+ 
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index 46d4a1fb..e619c124 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -860,6 +860,8 @@ export class InteractiveMode {
+ 	/** Persistent agents/resume left rail (daemon-backed sessions only). */
+ 	private agentsSidebar: AgentsSidebar | undefined;
+ 	private agentsSidebarFocused = false;
++	/** Whether the sidebar rail is currently shown (toggled via app.sidebar.toggle). */
++	private agentsSidebarVisible = true;
+ 	private unsubscribeAgentsSidebarInput: (() => void) | undefined;
+ 	private loadingAnimation: Loader | undefined = undefined;
+ 	private workingMessage: string | undefined = undefined;
+@@ -4137,6 +4139,7 @@ export class InteractiveMode {
+ 		this.defaultEditor.onAction("app.session.resume", () => {
+ 			void this.requestAgentsView();
+ 		});
++		this.defaultEditor.onAction("app.sidebar.toggle", () => this.toggleAgentsSidebar());
+ 		this.defaultEditor.onAgentsBack = () => this.handleAgentsBack();
+ 		this.defaultEditor.onMoveBelowPrompt = () => this.focusSubagentSummary();
+ 
+@@ -4798,6 +4801,24 @@ export class InteractiveMode {
+ 					this.setFullscreenMode(enable);
+ 					return;
+ 				}
++				if (commandName === "sidebar") {
++					this.editor.setText("");
++					const arg = commandArgs?.trim().toLowerCase();
++					if (arg && arg !== "on" && arg !== "off") {
++						this.showError("Usage: /sidebar [on|off]");
++						return;
++					}
++					if (arg === "on" && this.agentsSidebarVisible) {
++						this.showStatus("Sidebar is already shown");
++						return;
++					}
++					if (arg === "off" && !this.agentsSidebarVisible) {
++						this.showStatus("Sidebar is already hidden");
++						return;
++					}
++					this.toggleAgentsSidebar();
++					return;
++				}
+ 				if (commandName === "debug" && !commandArgs) {
+ 					await this.handleDebugCommand();
+ 					this.editor.setText("");
+@@ -6743,6 +6764,11 @@ export class InteractiveMode {
+ 		// Route keys to the sidebar only while it is focused; everything else
+ 		// flows through to the editor untouched.
+ 		this.unsubscribeAgentsSidebarInput = this.ui.addInputListener((data: string) => {
++			// Toggle works even while the rail has focus (hiding it returns to the editor).
++			if (this.agentsSidebar && getKeybindings().matches(data, "app.sidebar.toggle")) {
++				this.toggleAgentsSidebar();
++				return { consume: true };
++			}
+ 			if (!this.agentsSidebarFocused || !this.agentsSidebar) return undefined;
+ 			const kb = getKeybindings();
+ 			if (kb.matches(data, "app.sidebar.kill")) {
+@@ -6830,13 +6856,35 @@ export class InteractiveMode {
+ 		this.ui.setLeftRail(null);
+ 	}
+ 
++	/** Toggle the persistent agents/resume sidebar on or off. */
++	private toggleAgentsSidebar(): void {
++		if (!this.agentsSidebar) {
++			this.showStatus("The sidebar needs a daemon session. Start one with a socket to use it.", "warning");
++			return;
++		}
++		this.agentsSidebarVisible = !this.agentsSidebarVisible;
++		if (!this.agentsSidebarVisible) {
++			// Hiding the rail also drops any sidebar focus back to the editor.
++			if (this.agentsSidebarFocused) {
++				this.agentsSidebarFocused = false;
++			}
++			this.ui.setLeftRail(null);
++		} else {
++			this.ui.setLeftRail(this.agentsSidebar, SIDEBAR_WIDTH);
++		}
++		this.showStatus(this.agentsSidebarVisible ? "Sidebar shown" : "Sidebar hidden");
++		this.ui.requestRender();
++	}
++
+ 	private handleAgentsBack(): boolean {
+ 		if (this.editor.getText().trim()) {
+ 			return false;
+ 		}
+-		// With the persistent rail mounted, left arrow focuses it instead of
+-		// tearing down to the full-screen agents view.
+-		if (this.agentsSidebar) {
++		// With the persistent rail mounted and shown, left arrow focuses it
++		// instead of tearing down to the full-screen agents view. When the
++		// rail was toggled off, fall through to the full-screen agents view so
++		// the agents/resume path stays reachable.
++		if (this.agentsSidebar && this.agentsSidebarVisible) {
+ 			this.focusAgentsSidebar();
+ 			return true;
+ 		}
+@@ -9553,6 +9601,7 @@ ${shortcutsKey ? `\`${shortcutsKey}\` quick shortcuts · ` : ""}\`/hotkeys\` ful
+ 	}
+ 
+ 	private getHotkeysGuide(): string {
++		const sidebarToggle = this.getAppKeyDisplay("app.sidebar.toggle");
+ 		const sidebarSearch = this.getAppKeyDisplay("app.sidebar.search");
+ 		const sidebarNext = this.getAppKeyDisplay("app.sidebar.nextSession");
+ 		const sidebarPrev = this.getAppKeyDisplay("app.sidebar.prevSession");
+@@ -9669,5 +9717,6 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
+ **Sidebar (agents/resume, \`/agents\`)**
+ | Key | Action |
+ |-----|--------|
++| \`${sidebarToggle}\` | Toggle the sidebar on/off |
+ | \`${sidebarSearch}\` | Filter the roster by session search |
+ | \`${sidebarNext}\` / \`${sidebarPrev}\` | Jump to the next / previous session |

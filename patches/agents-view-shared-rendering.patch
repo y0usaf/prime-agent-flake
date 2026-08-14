@@ -1,0 +1,964 @@
+diff --git a/packages/coding-agent/src/modes/agents-view/agents-view-actions.ts b/packages/coding-agent/src/modes/agents-view/agents-view-actions.ts
+new file mode 100644
+index 00000000..94903661
+--- /dev/null
++++ b/packages/coding-agent/src/modes/agents-view/agents-view-actions.ts
+@@ -0,0 +1,112 @@
++/**
++ * Shared keybinding → action resolution for the agents/resume roster.
++ *
++ * The full-screen agents view (AgentsViewMode) and the persistent left
++ * sidebar (AgentsSidebar) both drive the same roster. Historically each had its
++ * own keyboard dispatch: the full view handled `app.agents.*` (new/delete/
++ * rename/reply/program/open) plus navigation, while the sidebar only handled a
++ * reduced `app.sidebar.*` set — so ctrl+n / ctrl+x / ctrl+r worked in the
++ * agents view but not in the sidebar, and the sidebar kept its own divergent
++ * search/nav logic.
++ *
++ * This module is the single key-dispatch path: `resolveAgentsViewKeyAction`
++ * maps an input chunk + the current UI state to a `AgentsViewKeyAction`, and
++ * both consumers switch on the result. The sidebar therefore gets every
++ * agents-view keybinding (ctrl+n new, ctrl+x delete, ctrl+r rename, space
++ * reply, ctrl+o program, ctrl+c clear, up/down/page navigation, search text)
++ * for free — same keys, same roster, one dispatch implementation.
++ */
++
++/** A resolved roster input: what the focused consumer should do. */
++export type AgentsViewKeyAction =
++	| { type: "rename" }
++	| { type: "delete" }
++	| { type: "reply" }
++	| { type: "new" }
++	| { type: "program" }
++	| { type: "open" }
++	| { type: "followUp" }
++	| { type: "clear" }
++	| { type: "nav"; delta: number }
++	| { type: "cancel" }
++	| { type: "search-commit" }
++	| { type: "text"; data: string }
++	| { type: "none" };
++
++/** Minimal keybinding matcher both consumers satisfy. */
++export interface AgentsViewKeyMatcher {
++	matches(data: string, keybindingName: string): boolean;
++}
++
++/** UI state the dispatcher needs to apply the agents-view guards. */
++export interface AgentsViewKeyState {
++	/** The search/filter text is empty (rename/delete/reply/program/open require it). */
++	textEmpty: boolean;
++	/** A rename input is active (its keys go to the rename editor, not the roster). */
++	renameActive: boolean;
++	/** A reply composer is armed (new/program/open/nav are suppressed). */
++	replyActive: boolean;
++	/** Search cursor is at the end of the text (open is allowed while filtered). */
++	searchCursorAtEnd: boolean;
++	/** How many rows are visible, for page-up/page-down magnitude. */
++	visibleRows: number;
++	/** True while the sidebar search input is being edited (kept by the sidebar). */
++	searchActive?: boolean;
++}
++
++/**
++ * Resolve one input chunk to a roster action. The guards mirror the full
++ * agents view's handleInput exactly, so a key behaves the same in both UIs.
++ */
++export function resolveAgentsViewKeyAction(
++	data: string,
++	kb: AgentsViewKeyMatcher,
++	state: AgentsViewKeyState,
++): AgentsViewKeyAction {
++	if (state.renameActive) {
++		if (kb.matches(data, "tui.select.cancel")) return { type: "cancel" };
++		return { type: "text", data };
++	}
++	if (kb.matches(data, "app.clear")) {
++		return { type: "clear" };
++	}
++	if (state.textEmpty && kb.matches(data, "app.agents.rename")) {
++		return { type: "rename" };
++	}
++	if (state.textEmpty && kb.matches(data, "app.agents.delete")) {
++		return { type: "delete" };
++	}
++	if (state.textEmpty && kb.matches(data, "app.agents.reply")) {
++		return { type: "reply" };
++	}
++	if (!state.replyActive && kb.matches(data, "app.agents.new")) {
++		return { type: "new" };
++	}
++	if (state.replyActive && kb.matches(data, "app.message.followUp")) {
++		return { type: "followUp" };
++	}
++	if (state.textEmpty && kb.matches(data, "app.agents.program")) {
++		return { type: "program" };
++	}
++	if (!state.replyActive && kb.matches(data, "app.agents.open")) {
++		if (state.textEmpty || state.searchCursorAtEnd) {
++			return { type: "open" };
++		}
++	}
++	if (!state.replyActive && kb.matches(data, "tui.select.up")) {
++		return { type: "nav", delta: -1 };
++	}
++	if (!state.replyActive && kb.matches(data, "tui.select.down")) {
++		return { type: "nav", delta: 1 };
++	}
++	if (!state.replyActive && kb.matches(data, "tui.select.pageUp")) {
++		return { type: "nav", delta: -Math.max(1, state.visibleRows) };
++	}
++	if (!state.replyActive && kb.matches(data, "tui.select.pageDown")) {
++		return { type: "nav", delta: Math.max(1, state.visibleRows) };
++	}
++	if (state.searchActive && kb.matches(data, "tui.input.tab")) {
++		return { type: "search-commit" };
++	}
++	return { type: "text", data };
++}
+diff --git a/packages/coding-agent/src/modes/agents-view/agents-view-mode.ts b/packages/coding-agent/src/modes/agents-view/agents-view-mode.ts
+index 47fee3ad..ab7675d7 100644
+--- a/packages/coding-agent/src/modes/agents-view/agents-view-mode.ts
++++ b/packages/coding-agent/src/modes/agents-view/agents-view-mode.ts
+@@ -10,7 +10,6 @@ import {
+ 	setKeybindings,
+ 	TUI,
+ 	truncateToWidth,
+-	visibleWidth,
+ 	wrapTextWithAnsi,
+ } from "@earendil-works/pi-tui";
+ import { APP_TITLE, appendRotatingLog, getAgentDir, getClientErrorLogPath, VERSION } from "../../config.js";
+@@ -75,7 +74,6 @@ import {
+ 	buildUnifiedSessionIndex,
+ 	createUnattachableChildOpenResult,
+ 	filterUnifiedSessions,
+-	formatHeartbeatBadge,
+ 	getAgentsViewSelectionKey,
+ 	getAgentsViewSessionTitle,
+ 	getAgentsViewSummaryIdentity as getSummaryIdentity,
+@@ -95,6 +93,14 @@ import {
+ 	type UnifiedSessionRecord,
+ } from "./agents-view-state.js";
+ import { matchesSearchText } from "./session-view-search.js";
++import {
++	finalizeAgentsViewLine,
++	formatAgentsViewRelativeTime,
++	renderAgentsViewRow,
++} from "./agents-view-render.js";
++import { resolveAgentsViewKeyAction } from "./agents-view-actions.js";
++// Re-exported so existing importers (and the agents-view tests) keep working.
++export { formatAgentsViewRelativeTime } from "./agents-view-render.js";
+ 
+ const POLL_INTERVAL_MS = 1000;
+ const HEARTBEAT_POLL_INTERVAL_MS = 15000;
+@@ -106,12 +112,6 @@ const STATUS_MESSAGE_DURATION_MS = 4500;
+ const SEARCH_PROMPT_PLACEHOLDER = "Search sessions";
+ const REPLY_PROMPT_FALLBACK_PLACEHOLDER = "Write a reply to this agent";
+ const RESUME_PROMPT_PLACEHOLDER = "Write a prompt to resume this session";
+-const COMPLETED_ROW_ICON = "✓";
+-const NEEDS_INPUT_ROW_ICON = "●";
+-const SELECTED_ROW_MARKER = "\0agents-view-selected-row\0";
+-// Tags a spawn-code line so finalize can wrap the whole row in a panel
+-// background, visually segmenting the program from the agent rows.
+-const CODE_ROW_MARKER = "\0agents-view-code-row\0";
+ 
+ export interface AgentsViewModeOptions {
+ 	socketPath?: string;
+@@ -872,63 +872,64 @@ export class AgentsViewMode implements Component, Focusable {
+ 
+ 	handleInput(data: string): void {
+ 		this.clearStickyStatusMessage();
+-		if (this.renameTarget) {
+-			if (this.keybindings.matches(data, "tui.select.cancel")) {
+-				this.exitRenameMode();
++		const action = resolveAgentsViewKeyAction(data, this.keybindings, {
++			textEmpty: this.editor.getText().length === 0,
++			renameActive: this.renameTarget !== undefined,
++			replyActive: this.replyTarget !== undefined,
++			searchCursorAtEnd: this.isSearchCursorAtEnd(),
++			visibleRows: this.visibleListRows(),
++		});
++		switch (action.type) {
++			case "rename":
++				this.enterRenameMode();
+ 				return;
+-			}
+-			this.editor.handleInput(data);
+-			return;
+-		}
+-		if (this.keybindings.matches(data, "app.clear")) {
+-			// The composer hints advertise ctrl+c as cancel; it must not start the exit flow.
+-			if (this.replyTarget) {
+-				this.setReplyTarget(undefined);
++			case "delete":
++				this.clearCtrlCExitHint({ render: false });
++				void this.handleDeleteSelected();
+ 				return;
+-			}
+-			this.handleCtrlC();
+-			return;
+-		}
+-		if (this.editor.getText().length === 0 && this.keybindings.matches(data, "app.agents.rename")) {
+-			this.enterRenameMode();
+-			return;
+-		}
+-		if (this.editor.getText().length === 0 && this.keybindings.matches(data, "app.agents.delete")) {
+-			this.clearCtrlCExitHint({ render: false });
+-			void this.handleDeleteSelected();
+-			return;
+-		}
+-		this.clearCtrlCExitHint({ render: false });
+-		this.clearDeleteConfirmation({ render: false });
+-		if (this.keybindings.matches(data, "app.agents.reply") && this.editor.getText().length === 0) {
+-			void this.toggleReplyTarget();
+-			return;
+-		}
+-		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.new")) {
+-			void this.createNewSession();
+-			return;
+-		}
+-		if (this.replyTarget && this.keybindings.matches(data, "app.message.followUp")) {
+-			this.handleReplyFollowUp();
+-			return;
+-		}
+-		if (this.editor.getText().length === 0 && this.keybindings.matches(data, "app.agents.program")) {
+-			this.cycleProgramForSelected();
+-			return;
+-		}
+-		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.open")) {
+-			if (this.editor.getText().length === 0 || this.isSearchCursorAtEnd()) {
++			case "reply":
++				void this.toggleReplyTarget();
++				return;
++			case "new":
++				void this.createNewSession();
++				return;
++			case "followUp":
++				this.handleReplyFollowUp();
++				return;
++			case "program":
++				this.cycleProgramForSelected();
++				return;
++			case "open":
+ 				this.openSelected();
+ 				return;
++			case "clear":
++				// The composer hints advertise ctrl+c as cancel; it must not start the exit flow.
++				if (this.replyTarget) {
++					this.setReplyTarget(undefined);
++				} else {
++					this.handleCtrlC();
++				}
++				return;
++			case "nav":
++				this.clearCtrlCExitHint({ render: false });
++				this.clearDeleteConfirmation({ render: false });
++				this.moveSelection(action.delta);
++				return;
++			case "cancel":
++				this.exitRenameMode();
++				return;
++			case "text": {
++				this.clearCtrlCExitHint({ render: false });
++				this.clearDeleteConfirmation({ render: false });
++				const previous = this.editor.getText();
++				this.editor.handleInput(data);
++				if (!this.replyTarget && this.editor.getText() !== previous) {
++					this.queryChanged();
++				}
++				return;
+ 			}
+-		}
+-		if (!this.replyTarget && this.handleListNavigation(data)) {
+-			return;
+-		}
+-		const previous = this.editor.getText();
+-		this.editor.handleInput(data);
+-		if (!this.replyTarget && this.editor.getText() !== previous) {
+-			this.queryChanged();
++			default:
++				return;
+ 		}
+ 	}
+ 
+@@ -945,7 +946,7 @@ export class AgentsViewMode implements Component, Focusable {
+ 		while (lines.length < height) {
+ 			lines.push("");
+ 		}
+-		return lines.slice(0, height).map((line) => this.finalizeRenderedLine(line, safeWidth));
++		return lines.slice(0, height).map((line) => finalizeAgentsViewLine(line, safeWidth));
+ 	}
+ 
+ 	invalidate(): void {
+@@ -1027,26 +1028,6 @@ export class AgentsViewMode implements Component, Focusable {
+ 		return formatted.flatMap((line) => wrapTextWithAnsi(line, wrapWidth).map((wrapped) => ` ${wrapped}`));
+ 	}
+ 
+-	private handleListNavigation(data: string): boolean {
+-		if (this.keybindings.matches(data, "tui.select.up")) {
+-			this.moveSelection(-1);
+-			return true;
+-		}
+-		if (this.keybindings.matches(data, "tui.select.down")) {
+-			this.moveSelection(1);
+-			return true;
+-		}
+-		if (this.keybindings.matches(data, "tui.select.pageUp")) {
+-			this.moveSelection(-Math.max(1, this.visibleListRows()));
+-			return true;
+-		}
+-		if (this.keybindings.matches(data, "tui.select.pageDown")) {
+-			this.moveSelection(Math.max(1, this.visibleListRows()));
+-			return true;
+-		}
+-		return false;
+-	}
+-
+ 	private handleCtrlC(): void {
+ 		if (this.isCtrlCExitHintVisible()) {
+ 			this.finish({ type: "exit" });
+@@ -2488,7 +2469,7 @@ export class AgentsViewMode implements Component, Focusable {
+ 			);
+ 		}
+ 
+-		const displayItems = buildDisplayItems(this.rows);
++		const displayItems = buildAgentsViewDisplayItems(this.rows);
+ 		const selectedIdentity = this.rows[this.selectedIndex]?.identity;
+ 		const selectedDisplayIndex = displayItems.findIndex(
+ 			(item) => item.type === "row" && item.row.identity === selectedIdentity,
+@@ -2518,7 +2499,7 @@ export class AgentsViewMode implements Component, Focusable {
+ 			if (item.type === "empty") {
+ 				return theme.fg("dim", "  No agents");
+ 			}
+-			return this.renderRow(item.row, width);
++			return renderAgentsViewRow(item.row, this.renderRowContext(item.row, width));
+ 		});
+ 		if (showLeadingEllipsis) {
+ 			lines.unshift(theme.fg("dim", "  ..."));
+@@ -2529,120 +2510,34 @@ export class AgentsViewMode implements Component, Focusable {
+ 		return lines;
+ 	}
+ 
+-	private renderRow(row: AgentsViewRow, width: number): string {
+-		const selected = row.selectable && row.identity === this.rows[this.selectedIndex]?.identity;
+-		if (row.kind === "subagent-code") {
+-			return this.renderCodeRow(row);
+-		}
+-		if (row.kind === "subagent-summary") {
+-			const indent = "  ".repeat(row.depth);
+-			const hint = row.hasSpawnCode ? theme.fg("dim", ` · ${keyText("app.agents.program")} show program`) : "";
+-			const label = `${theme.fg("dim", `▸ ${row.title}`)}${hint}`;
+-			const line = padLine(truncateToWidth(`${indent}${label}`, width, ""), width);
+-			return selected ? `${SELECTED_ROW_MARKER}${line}` : line;
+-		}
+-		const pendingDelete = row.kind === "agent" && this.isPendingDeleteRow(row);
+-		const pendingKill = row.kind === "subagent" && this.isPendingKillSubagentRow(row);
+-		const rawIcon = this.getRowIcon(row.section);
+-		const icon = this.formatRowIcon(row.section, rawIcon);
+-		const indent = "  ".repeat(row.depth);
+-		const age = formatSessionDuration(row.summary);
+-		const details = row.section === "inactive" ? `${row.summary.messageCount} · ${age}` : age;
+-		const detailsWidth = row.section === "inactive" ? Math.max(10, visibleWidth(details)) : 10;
+-		const heartbeatBadge = !pendingDelete && !pendingKill ? formatHeartbeatBadge(row.heartbeat) : "";
+-		const heartbeatCell = heartbeatBadge ? theme.fg("error", heartbeatBadge) : "";
+-		const heartbeatWidth = visibleWidth(heartbeatBadge);
+-		const titleWidth = Math.max(
+-			0,
+-			width -
+-				visibleWidth(indent) -
+-				visibleWidth(rawIcon) -
+-				detailsWidth -
+-				2 -
+-				(heartbeatWidth > 0 ? heartbeatWidth + 1 : 0),
+-		);
+-		const title = pendingDelete
+-			? this.getPendingDeleteTitle()
+-			: pendingKill
+-				? `${keyText("app.agents.delete")} again to ${row.section === "running" ? "stop" : "delete"}`
+-				: styleRowTitle(row);
+-		// Append the background summary as a dim suffix on the same line, e.g.
+-		// "fix auth · Refactoring token validation". Hidden during delete/stop
+-		// confirmations so the warning text stands alone.
+-		const summaryText = !pendingDelete && !pendingKill ? row.summary.summary : undefined;
+-		const titleContent = summaryText ? `${title} ${theme.fg("dim", `· ${summaryText}`)}` : title;
+-		const titleCell = formatTableCell(titleContent, titleWidth);
+-		const cells = [
+-			icon,
+-			pendingDelete || pendingKill ? theme.fg("error", titleCell) : titleCell,
+-			formatRightTableCell(details, detailsWidth),
+-		];
+-		const base = `${indent}${cells[0]} ${heartbeatCell ? `${heartbeatCell} ` : ""}${cells[1]} ${cells[2]}`;
+-		const line = padLine(truncateToWidth(base, width, ""), width);
+-		return selected ? `${SELECTED_ROW_MARKER}${line}` : line;
+-	}
+-
+-	// Spawn-code rows are read-only context. They render deemphasized — muted
+-	// text on a panel background (applied in finalizeRenderedLine) so the program
+-	// reads as one quiet segmented block rather than competing with agent rows.
+-	private renderCodeRow(row: AgentsViewRow): string {
+-		const indent = "  ".repeat(row.depth);
+-		const body = theme.fg("muted", row.code || " ");
+-		return `${CODE_ROW_MARKER}${indent}  ${body}`;
+-	}
+-
+-	private finalizeRenderedLine(line: string, width: number): string {
+-		const code = line.startsWith(CODE_ROW_MARKER);
+-		const selected = !code && line.startsWith(SELECTED_ROW_MARKER);
+-		let content = code
+-			? line.slice(CODE_ROW_MARKER.length)
+-			: selected
+-				? line.slice(SELECTED_ROW_MARKER.length)
+-				: line;
+-		// Each rendered line must occupy exactly one terminal row; a stray
+-		// newline would shift every line below it and overlap the editor.
+-		if (content.includes("\n") || content.includes("\r")) {
+-			content = content.replace(/[\r\n]+/g, " ");
+-		}
+-		const padded = padLine(truncateToWidth(content, width), width);
+-		if (code) {
+-			return theme.bg("toolPanelBg", padded);
+-		}
+-		if (!selected) {
+-			return padded;
+-		}
+-		// Truncating styled cells embeds full \x1b[0m resets; re-open the
+-		// selection background after each so the highlight spans the whole row.
+-		const applySelectionBg = theme.getSelectionBackgroundColor();
+-		return padded.split("\x1b[0m").map(applySelectionBg).join("\x1b[0m");
++	/** Build the shared render context for a roster row (full view: all chrome). */
++	private renderRowContext(row: AgentsViewRow, width: number): Parameters<typeof renderAgentsViewRow>[1] {
++		return {
++			width,
++			selected: row.selectable && row.identity === this.rows[this.selectedIndex]?.identity,
++			workingIconFrame: this.workingIconFrame,
++			pendingDeleteIdentity: row.kind === "agent" ? this.pendingDeleteAgent?.identity : undefined,
++			pendingKillIdentity: row.kind === "subagent" ? this.pendingKillSubagent?.identity : undefined,
++			deleteConfirmationVisible: this.isDeleteConfirmationVisible(),
++			pendingDeleteStopped: this.pendingDeleteAgent?.stopped ?? false,
++		};
+ 	}
+ 
++	// A delete confirmation is visible when the daemon owns the row and we're
++	// in the two-step confirm window (kept here; used by selection guarding).
+ 	private isPendingDeleteRow(row: AgentsViewRow): boolean {
+ 		return (
+ 			getSummaryIdentity(row.summary) === this.pendingDeleteAgent?.identity && this.isDeleteConfirmationVisible()
+ 		);
+ 	}
+ 
+-	private isPendingKillSubagentRow(row: AgentsViewRow): boolean {
+-		return (
+-			getSummaryIdentity(row.summary) === this.pendingKillSubagent?.identity && this.isDeleteConfirmationVisible()
+-		);
+-	}
+-
+-	private getPendingDeleteTitle(): string {
+-		const deleteKey = keyText("app.agents.delete");
+-		return this.pendingDeleteAgent?.stopped
+-			? `stopped - ${deleteKey} again to remove`
+-			: `${deleteKey} again to remove`;
+-	}
+-
+ 	private renderPrompt(width: number): string[] {
+ 		return this.editor.render(width);
+ 	}
+ 
+ 	private renderDock(width: number): string[] {
+ 		const safeWidth = Math.max(1, width);
+-		return [this.renderHints(safeWidth)].map((line) => this.finalizeRenderedLine(line, safeWidth));
++		return [this.renderHints(safeWidth)].map((line) => finalizeAgentsViewLine(line, safeWidth));
+ 	}
+ 
+ 	private renderHints(width: number): string {
+@@ -2721,45 +2616,38 @@ export class AgentsViewMode implements Component, Focusable {
+ 		return this.rows[this.selectedIndex]?.summary.cwd ?? this.options.uiServices.getInitialCwd();
+ 	}
+ 
+-	private getRowIcon(section: AgentsViewSection): string {
+-		switch (section) {
+-			case "running":
+-				return workingIconFrame(this.workingIconFrame);
+-			case "idle":
+-				return NEEDS_INPUT_ROW_ICON;
+-			case "inactive":
+-				return COMPLETED_ROW_ICON;
+-			default: {
+-				const _exhaustive: never = section;
+-				return _exhaustive;
+-			}
+-		}
+-	}
++}
++function countRowsBySection(rows: readonly AgentsViewRow[]): Record<AgentsViewSection, number> {
++	const agents = rows.filter((row) => row.kind === "agent");
++	return {
++		running: agents.filter((row) => row.section === "running").length,
++		idle: agents.filter((row) => row.section === "idle").length,
++		inactive: agents.filter((row) => row.section === "inactive").length,
++	};
++}
+ 
+-	private formatRowIcon(section: AgentsViewSection, icon: string): string {
+-		switch (section) {
+-			case "running":
+-				return theme.bold(icon);
+-			case "idle":
+-				return theme.fg("warning", icon);
+-			case "inactive":
+-				return theme.fg("dim", icon);
+-			default: {
+-				const _exhaustive: never = section;
+-				return _exhaustive;
+-			}
+-		}
+-	}
++function getSelectedRowIdentity(row: AgentsViewRow | undefined): string | undefined {
++	return row?.identity;
++}
++
++function rowHasSpawnCode(row: AgentsViewRow): boolean {
++	const code = row.summary.spawnCode;
++	return typeof code === "string" && code.trim().length > 0;
+ }
+ 
+-type DisplayItem =
++function isRunningSessionSummary(summary: SessionSummary): boolean {
++	return summary.activity === "working";
++}
++
++type AgentsViewDisplayItem =
+ 	| { type: "spacer" }
+ 	| { type: "heading"; section: AgentsViewSection }
+ 	| { type: "empty"; section: AgentsViewSection }
+ 	| { type: "row"; row: AgentsViewRow };
+ 
+-function buildDisplayItems(rows: readonly AgentsViewRow[]): DisplayItem[] {
+-	const items: DisplayItem[] = [];
++/** Build the flattened display list (spacers, headings, rows) for a roster. */
++function buildAgentsViewDisplayItems(rows: readonly AgentsViewRow[]): AgentsViewDisplayItem[] {
++	const items: AgentsViewDisplayItem[] = [];
+ 	const sections: AgentsViewSection[] = ["running", "idle", "inactive"];
+ 	for (const [index, section] of sections.entries()) {
+ 		if (index > 0) {
+@@ -2794,85 +2682,6 @@ function getDisplayRowsForSection(rows: readonly AgentsViewRow[], section: Agent
+ 	return result;
+ }
+ 
+-function countRowsBySection(rows: readonly AgentsViewRow[]): Record<AgentsViewSection, number> {
+-	const agents = rows.filter((row) => row.kind === "agent");
+-	return {
+-		running: agents.filter((row) => row.section === "running").length,
+-		idle: agents.filter((row) => row.section === "idle").length,
+-		inactive: agents.filter((row) => row.section === "inactive").length,
+-	};
+-}
+-
+-function getSelectedRowIdentity(row: AgentsViewRow | undefined): string | undefined {
+-	return row?.identity;
+-}
+-
+-function rowHasSpawnCode(row: AgentsViewRow): boolean {
+-	const code = row.summary.spawnCode;
+-	return typeof code === "string" && code.trim().length > 0;
+-}
+-
+-function isRunningSessionSummary(summary: SessionSummary): boolean {
+-	return summary.activity === "working";
+-}
+-
+-// Explicit session names read bold so they stand out from fallback titles
+-// (first prompt, cwd, ids); the "(no messages)" placeholder reads italic.
+-function styleRowTitle(row: AgentsViewRow): string {
+-	if (row.summary.sessionName?.replace(/\s+/g, " ").trim()) {
+-		return theme.bold(row.title);
+-	}
+-	if (row.title === "(no messages)") {
+-		return theme.italic(row.title);
+-	}
+-	return row.title;
+-}
+-
+-function formatTableCell(value: string, width: number): string {
+-	const truncated = truncateToWidth(value, width, "");
+-	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
+-}
+-
+-function formatRightTableCell(value: string, width: number): string {
+-	const truncated = truncateToWidth(value, width, "");
+-	return " ".repeat(Math.max(0, width - visibleWidth(truncated))) + truncated;
+-}
+-
+-function formatSessionDuration(summary: SessionSummary): string {
+-	return formatAgentsViewRelativeTime(
+-		summary.activeSessionId ? (summary.created ?? summary.modified) : (summary.modified ?? summary.created),
+-	);
+-}
+-
+-export function formatAgentsViewRelativeTime(value: string | undefined, now: number = Date.now()): string {
+-	const timestamp = parseSessionTimestamp(value);
+-	if (!timestamp) {
+-		return "";
+-	}
+-	const seconds = Math.max(0, Math.floor((now - timestamp) / 1000));
+-	if (seconds < 60) {
+-		return `${seconds}s`;
+-	}
+-	const minutes = Math.floor(seconds / 60);
+-	if (minutes < 60) {
+-		return `${minutes}m`;
+-	}
+-	const hours = Math.floor(minutes / 60);
+-	if (hours < 24) {
+-		return `${hours}h`;
+-	}
+-	const days = Math.floor(hours / 24);
+-	return `${days}d`;
+-}
+-
+-function parseSessionTimestamp(value: string | undefined): number | undefined {
+-	if (!value) {
+-		return undefined;
+-	}
+-	const timestamp = Date.parse(value);
+-	return Number.isNaN(timestamp) ? undefined : timestamp;
+-}
+-
+ function requireDaemonData(response: DaemonResponse): unknown {
+ 	if (!response.success) {
+ 		throw new Error(response.error);
+@@ -2919,6 +2728,4 @@ function logClientError(prefix: string, error: unknown): void {
+ 	appendRotatingLog(getClientErrorLogPath(), `[${new Date().toISOString()}] ${prefix}: ${detail}`);
+ }
+ 
+-function padLine(line: string, width: number): string {
+-	return line + " ".repeat(Math.max(0, width - visibleWidth(line)));
+-}
++
+diff --git a/packages/coding-agent/src/modes/agents-view/agents-view-render.ts b/packages/coding-agent/src/modes/agents-view/agents-view-render.ts
+new file mode 100644
+index 00000000..e038bf64
+--- /dev/null
++++ b/packages/coding-agent/src/modes/agents-view/agents-view-render.ts
+@@ -0,0 +1,259 @@
++/**
++ * Shared row-rendering pipeline for the agents/resume roster.
++ *
++ * The full-screen agents view (AgentsViewMode) and the persistent left
++ * sidebar (AgentsSidebar) both render the same unified roster. Historically the
++ * sidebar hand-rolled its own compact row renderer, which meant two divergent
++ * render paths for the same `AgentsViewRow` data. This module is the single
++ * render path: both consumers call `renderAgentsViewRow` / `finalizeAgentsViewLine`
++ * with the same options, so the sidebar is literally the agents view compressed
++ * to rail width — the same icon, styled title, summary suffix and age/details
++ * column, truncated to fit. (The only rail-specific option is
++ * `compactDeleteHint`, which shortens the delete-armed wording for the narrow
++ * column.)
++ *
++ * The renderer is pure: it takes an explicit render context (selection, working
++ * icon frame, pending delete/kill state) and returns marker-tagged lines that
++ * `finalizeAgentsViewLine` turns into final terminal rows (applying the
++ * selection background, truncating to exactly one row, etc.).
++ */
++
++import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
++import { keyText } from "../interactive/components/keybinding-hints.js";
++import { theme } from "../interactive/theme/theme.js";
++import { workingIconFrame } from "../interactive/theme/working-icon.js";
++import type { SessionSummary } from "../daemon/daemon-session-list.js";
++import {
++	formatHeartbeatBadge,
++	type AgentsViewRow,
++	type AgentsViewSection,
++} from "./agents-view-state.js";
++
++export const SELECTED_ROW_MARKER = "\0agents-view-selected-row\0";
++export const CODE_ROW_MARKER = "\0agents-view-code-row\0";
++
++/** Render options that differ between the full view and the narrow rail. */
++export interface AgentsViewRowRenderOptions {
++	/** Use the short "!delete?" armed-hint wording instead of the full-view
++	 *  "ctrl+x again to remove" (the narrow sidebar). */
++	compactDeleteHint?: boolean;
++}
++
++/** Render context for one row (state the renderer doesn't own). */
++export interface AgentsViewRowRenderContext {
++	width: number;
++	selected: boolean;
++	workingIconFrame: number;
++	options?: AgentsViewRowRenderOptions;
++	/** Identity of the row under a pending delete confirmation (full view only). */
++	pendingDeleteIdentity?: string;
++	/** Identity of the row under a pending subagent-kill confirmation (full view only). */
++	pendingKillIdentity?: string;
++	/** True while a delete/stop confirmation is visible. */
++	deleteConfirmationVisible?: boolean;
++	/** True when the pending delete already stopped the agent. */
++	pendingDeleteStopped?: boolean;
++	/** Bold the title of the row whose sessionId matches (sidebar current-session). */
++	highlightCurrentSessionId?: string;
++}
++
++/** Render a single roster row into a marker-tagged line. */
++export function renderAgentsViewRow(row: AgentsViewRow, ctx: AgentsViewRowRenderContext): string {
++	if (row.kind === "subagent-code") {
++		return renderCodeRow(row);
++	}
++	if (row.kind === "subagent-summary") {
++		const indent = "  ".repeat(row.depth);
++		const hint = row.hasSpawnCode
++			? theme.fg("dim", ` · ${keyText("app.agents.program")} show program`)
++			: "";
++		const label = `${theme.fg("dim", `▸ ${row.title}`)}${hint}`;
++		const line = padLine(truncateToWidth(`${indent}${label}`, ctx.width, ""), ctx.width);
++		return ctx.selected ? `${SELECTED_ROW_MARKER}${line}` : line;
++	}
++
++	const pendingDelete = row.kind === "agent" && isPendingDeleteRow(row, ctx);
++	const pendingKill = row.kind === "subagent" && isPendingKillSubagentRow(row, ctx);
++	const rawIcon = getRowIcon(row.section, ctx.workingIconFrame);
++	const icon = formatRowIcon(row.section, rawIcon);
++	const indent = "  ".repeat(row.depth);
++	const age = formatAgentsViewSessionDuration(row.summary);
++	const details = row.section === "inactive" ? `${row.summary.messageCount} · ${age}` : age;
++	const detailsWidth = row.section === "inactive" ? Math.max(10, visibleWidth(details)) : 10;
++	const heartbeatBadge = !pendingDelete && !pendingKill ? formatHeartbeatBadge(row.heartbeat) : "";
++	const heartbeatCell = heartbeatBadge ? theme.fg("error", heartbeatBadge) : "";
++	const heartbeatWidth = visibleWidth(heartbeatBadge);
++	const titleWidth = Math.max(
++		0,
++		ctx.width -
++			visibleWidth(indent) -
++			visibleWidth(rawIcon) -
++			detailsWidth -
++			2 -
++			(heartbeatWidth > 0 ? heartbeatWidth + 1 : 0),
++	);
++	const styledTitle = styleAgentsViewRowTitle(row);
++	const isCurrentHighlight =
++		ctx.highlightCurrentSessionId !== undefined && row.summary.sessionId === ctx.highlightCurrentSessionId;
++	const title = pendingDelete
++		? getPendingDeleteTitle(ctx)
++		: pendingKill
++			? `${keyText("app.agents.delete")} again to ${row.section === "running" ? "stop" : "delete"}`
++			: isCurrentHighlight && !ctx.selected
++				? theme.bold(styledTitle)
++				: styledTitle;
++	const summaryText = !pendingDelete && !pendingKill ? row.summary.summary : undefined;
++	const titleContent = summaryText ? `${title} ${theme.fg("dim", `· ${summaryText}`)}` : title;
++	const titleCell = formatTableCell(titleContent, titleWidth);
++	const cells = [
++		icon,
++		pendingDelete || pendingKill ? theme.fg("error", titleCell) : titleCell,
++		formatRightTableCell(details, detailsWidth),
++	];
++	const base = `${indent}${cells[0]} ${heartbeatCell ? `${heartbeatCell} ` : ""}${cells[1]} ${cells[2]}`;
++	const line = padLine(truncateToWidth(base, ctx.width, ""), ctx.width);
++	return ctx.selected ? `${SELECTED_ROW_MARKER}${line}` : line;
++}
++
++// Spawn-code rows are read-only context. They render deemphasized — muted
++// text on a panel background (applied in finalizeAgentsViewLine) so the program
++// reads as one quiet segmented block rather than competing with agent rows.
++function renderCodeRow(row: AgentsViewRow): string {
++	const indent = "  ".repeat(row.depth);
++	const body = theme.fg("muted", row.code || " ");
++	return `${CODE_ROW_MARKER}${indent}  ${body}`;
++}
++
++/** Turn a marker-tagged render line into a final single terminal row. */
++export function finalizeAgentsViewLine(line: string, width: number): string {
++	const code = line.startsWith(CODE_ROW_MARKER);
++	const selected = !code && line.startsWith(SELECTED_ROW_MARKER);
++	let content = code
++		? line.slice(CODE_ROW_MARKER.length)
++		: selected
++			? line.slice(SELECTED_ROW_MARKER.length)
++			: line;
++	// Each rendered line must occupy exactly one terminal row; a stray
++	// newline would shift every line below it and overlap the editor.
++	if (content.includes("\n") || content.includes("\r")) {
++		content = content.replace(/[\r\n]+/g, " ");
++	}
++	const padded = padLine(truncateToWidth(content, width), width);
++	if (code) {
++		return theme.bg("toolPanelBg", padded);
++	}
++	if (!selected) {
++		return padded;
++	}
++	// Truncating styled cells embeds full \x1b[0m resets; re-open the
++	// selection background after each so the highlight spans the whole row.
++	const applySelectionBg = theme.getSelectionBackgroundColor();
++	return padded.split("\x1b[0m").map(applySelectionBg).join("\x1b[0m");
++}
++
++function isPendingDeleteRow(row: AgentsViewRow, ctx: AgentsViewRowRenderContext): boolean {
++	return ctx.pendingDeleteIdentity !== undefined && row.identity === ctx.pendingDeleteIdentity && !!ctx.deleteConfirmationVisible;
++}
++
++function isPendingKillSubagentRow(row: AgentsViewRow, ctx: AgentsViewRowRenderContext): boolean {
++	return ctx.pendingKillIdentity !== undefined && row.identity === ctx.pendingKillIdentity && !!ctx.deleteConfirmationVisible;
++}
++
++function getPendingDeleteTitle(ctx: AgentsViewRowRenderContext): string {
++	if (ctx.options?.compactDeleteHint) {
++		return "!delete?";
++	}
++	const deleteKey = keyText("app.agents.delete");
++	return ctx.pendingDeleteStopped ? `stopped - ${deleteKey} again to remove` : `${deleteKey} again to remove`;
++}
++
++// Explicit session names read bold so they stand out from fallback titles
++// (first prompt, cwd, ids); the "(no messages)" placeholder reads italic.
++function styleAgentsViewRowTitle(row: AgentsViewRow): string {
++	if (row.summary.sessionName?.replace(/\s+/g, " ").trim()) {
++		return theme.bold(row.title);
++	}
++	if (row.title === "(no messages)") {
++		return theme.italic(row.title);
++	}
++	return row.title;
++}
++
++function formatTableCell(value: string, width: number): string {
++	const truncated = truncateToWidth(value, width, "");
++	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
++}
++
++function formatRightTableCell(value: string, width: number): string {
++	const truncated = truncateToWidth(value, width, "");
++	return " ".repeat(Math.max(0, width - visibleWidth(truncated))) + truncated;
++}
++
++function formatAgentsViewSessionDuration(summary: SessionSummary): string {
++	return formatAgentsViewRelativeTime(
++		summary.activeSessionId ? (summary.created ?? summary.modified) : (summary.modified ?? summary.created),
++	);
++}
++
++export function formatAgentsViewRelativeTime(value: string | undefined, now: number = Date.now()): string {
++	const timestamp = parseSessionTimestamp(value);
++	if (!timestamp) {
++		return "";
++	}
++	const seconds = Math.max(0, Math.floor((now - timestamp) / 1000));
++	if (seconds < 60) {
++		return `${seconds}s`;
++	}
++	const minutes = Math.floor(seconds / 60);
++	if (minutes < 60) {
++		return `${minutes}m`;
++	}
++	const hours = Math.floor(minutes / 60);
++	if (hours < 24) {
++		return `${hours}h`;
++	}
++	const days = Math.floor(hours / 24);
++	return `${days}d`;
++}
++
++function parseSessionTimestamp(value: string | undefined): number | undefined {
++	if (!value) {
++		return undefined;
++	}
++	const timestamp = Date.parse(value);
++	return Number.isNaN(timestamp) ? undefined : timestamp;
++}
++
++function padLine(line: string, width: number): string {
++	return line + " ".repeat(Math.max(0, width - visibleWidth(line)));
++}
++
++function getRowIcon(section: AgentsViewSection, frame: number): string {
++	switch (section) {
++		case "running":
++			return workingIconFrame(frame);
++		case "idle":
++			return "●";
++		case "inactive":
++			return "✓";
++		default: {
++			const _exhaustive: never = section;
++			return _exhaustive;
++		}
++	}
++}
++
++function formatRowIcon(section: AgentsViewSection, icon: string): string {
++	switch (section) {
++		case "running":
++			return theme.bold(icon);
++		case "idle":
++			return theme.fg("warning", icon);
++		case "inactive":
++			return theme.fg("dim", icon);
++		default: {
++			const _exhaustive: never = section;
++			return _exhaustive;
++		}
++	}
++}
+diff --git a/packages/coding-agent/test/agents-view-inactive-reply.test.ts b/packages/coding-agent/test/agents-view-inactive-reply.test.ts
+index e1733c40..8d2cccad 100644
+--- a/packages/coding-agent/test/agents-view-inactive-reply.test.ts
++++ b/packages/coding-agent/test/agents-view-inactive-reply.test.ts
+@@ -394,6 +394,9 @@ describe("agents view reply on inactive sessions", () => {
+ 			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
+ 			setReplyTarget,
+ 			handleCtrlC,
++			editor: { getText: () => "" },
++			isSearchCursorAtEnd: () => true,
++			visibleListRows: () => 10,
+ 		};
+ 
+ 		invoke("handleInput", self, "\x03");
+diff --git a/packages/coding-agent/test/suite/regressions/502-unified-session-view.test.ts b/packages/coding-agent/test/suite/regressions/502-unified-session-view.test.ts
+index e1b0d8d8..d3aefa0f 100644
+--- a/packages/coding-agent/test/suite/regressions/502-unified-session-view.test.ts
++++ b/packages/coding-agent/test/suite/regressions/502-unified-session-view.test.ts
+@@ -1,6 +1,8 @@
+ import stripAnsi from "strip-ansi";
+-import { describe, expect, test, vi } from "vitest";
++import { beforeAll, describe, expect, test, vi } from "vitest";
+ import { AgentsViewMode } from "../../../src/modes/agents-view/agents-view-mode.js";
++import { renderAgentsViewRow } from "../../../src/modes/agents-view/agents-view-render.js";
++import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
+ import type { SessionSummary } from "../../../src/modes/daemon/daemon-session-list.js";
+ import { createDeferred as deferred } from "../scheduling.js";
+ 
+@@ -65,6 +67,8 @@ function refreshHarness() {
+ 	};
+ }
+ 
++beforeAll(() => initTheme());
++
+ function privateMethod<T>(name: string): T {
+ 	const member = Reflect.get(AgentsViewMode.prototype, name) as T;
+ 	if (typeof member !== "function") {
+@@ -73,6 +77,8 @@ function privateMethod<T>(name: string): T {
+ 	return member;
+ }
+ 
++beforeAll(() => initTheme());
++
+ describe("#502 unified session view regressions", () => {
+ 	test.each(["live", "heartbeat"] as const)(
+ 		"an older overlapping %s poll cannot overwrite the newer response",
+@@ -462,11 +468,11 @@ describe("#502 unified session view regressions", () => {
+ 		};
+ 
+ 		const rendered = stripAnsi(
+-			privateMethod<(this: typeof harness, row: typeof inactive, width: number) => string>("renderRow").call(
+-				harness,
+-				inactive,
+-				50,
+-			),
++			renderAgentsViewRow(inactive, {
++				width: 50,
++				selected: false,
++				workingIconFrame: 0,
++			}),
+ 		);
+ 		expect(rendered).toMatch(/123456 · 2h\s*$/);
+ 	});
